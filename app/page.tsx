@@ -106,10 +106,12 @@ function GameApp() {
   });
 
   const [playerId] = useState(() => {
-    let pid = localStorage.getItem('flank_player_id');
+    if (typeof window === 'undefined') return 'user_init';
+    // Use sessionStorage so multiple browser tabs have distinct player IDs for multiplayer testing
+    let pid = sessionStorage.getItem('flank_player_session_id');
     if (!pid) {
-      pid = 'user_' + Math.random().toString(36).substring(2, 9);
-      localStorage.setItem('flank_player_id', pid);
+      pid = 'user_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
+      sessionStorage.setItem('flank_player_session_id', pid);
     }
     return pid;
   });
@@ -196,6 +198,7 @@ function GameApp() {
         setOnlineRoom(data.room);
         setMyOnlineRole(data.role);
         setMode('online_room');
+        setIsMatchmaking(false);
         sounds.playTurnAlert();
       } catch (err) {
         console.error(err);
@@ -247,10 +250,11 @@ function GameApp() {
       });
       const data = await res.json();
       if (data.status === 'matched' && data.roomId) {
-        joinOnlineRoom(data.roomId);
+        setIsMatchmaking(false);
+        await joinOnlineRoom(data.roomId);
       }
     } catch (err) {
-      console.error(err);
+      console.error('Start matchmaking error:', err);
       setIsMatchmaking(false);
     }
   };
@@ -268,11 +272,15 @@ function GameApp() {
     }
   };
 
-  // Poll matchmaking queue if searching
+  // Poll matchmaking queue if searching (Fast 400ms polling for instant match)
   useEffect(() => {
     if (!isMatchmaking) return;
 
-    const interval = setInterval(async () => {
+    let isSubscribed = true;
+    let timerId: NodeJS.Timeout;
+
+    const pollQueue = async () => {
+      if (!isSubscribed) return;
       try {
         const res = await fetch('/api/matchmaking', {
           method: 'POST',
@@ -280,55 +288,72 @@ function GameApp() {
           body: JSON.stringify({ action: 'poll', playerId }),
         });
         const data = await res.json();
-        if (data.status === 'matched' && data.roomId) {
-          clearInterval(interval);
+        if (isSubscribed && data.status === 'matched' && data.roomId) {
           setIsMatchmaking(false);
-          joinOnlineRoom(data.roomId);
+          await joinOnlineRoom(data.roomId);
+          return;
         }
       } catch (err) {
-        console.error(err);
+        console.error('Matchmaking poll error:', err);
       }
-    }, 1200);
 
-    return () => clearInterval(interval);
+      if (isSubscribed) {
+        timerId = setTimeout(pollQueue, 400);
+      }
+    };
+
+    timerId = setTimeout(pollQueue, 400);
+
+    return () => {
+      isSubscribed = false;
+      clearTimeout(timerId);
+    };
   }, [isMatchmaking, playerId, joinOnlineRoom]);
 
-  // ----------------- ONLINE ROOM POLLING -----------------
+  // ----------------- ONLINE ROOM POLLING (ZERO-DELAY SYNC) -----------------
 
   const prevMoveRef = useRef<number>(0);
   const roomId = onlineRoom?.id;
   const isOnlineGameOver = onlineRoom?.isGameOver;
+  const currentRoomTurn = onlineRoom?.currentTurn;
+  const roomStatus = onlineRoom?.status;
 
   useEffect(() => {
     if (mode !== 'online_room' || !roomId) return;
 
-    const interval = setInterval(async () => {
+    let isSubscribed = true;
+    let pollTimer: NodeJS.Timeout;
+
+    const fetchRoomState = async () => {
+      if (!isSubscribed) return;
+
       try {
         const res = await fetch(`/api/rooms/${roomId}?playerId=${playerId}`);
         const data = await res.json();
-        if (data.success && data.room) {
+        if (isSubscribed && data.success && data.room) {
           const room: GameRoom = data.room;
 
           // Sound triggers on new opponent move
           const moveLen = room.moveHistory.length;
           if (moveLen > prevMoveRef.current) {
-            prevMoveRef.current = moveLen;
             const lastM = room.moveHistory[moveLen - 1];
-            sounds.playStoneClack();
-            if (lastM.flippedCount > 0) {
-              sounds.playFlipStone(lastM.flippedCount);
+            if (lastM && lastM.player !== myOnlineRole) {
+              sounds.playStoneClack();
+              if (lastM.flippedCount > 0) {
+                sounds.playFlipStone(lastM.flippedCount);
+              }
+              if (room.currentTurn === myOnlineRole && !room.isGameOver) {
+                sounds.playTurnAlert();
+              }
             }
-
-            if (room.currentTurn === myOnlineRole && !room.isGameOver) {
-              sounds.playTurnAlert();
-            }
+            prevMoveRef.current = moveLen;
           }
 
           if (room.isGameOver && !isOnlineGameOver) {
             sounds.playVictory();
           }
 
-          // Calculate time left
+          // Calculate time left (45s max per turn)
           const elapsed = (Date.now() - room.turnStartTime) / 1000;
           const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
           setTurnTimeLeft(remaining);
@@ -338,19 +363,62 @@ function GameApp() {
       } catch (err) {
         console.error('Polling room error:', err);
       }
-    }, 850);
 
-    return () => clearInterval(interval);
-  }, [mode, roomId, playerId, myOnlineRole, isOnlineGameOver]);
+      if (isSubscribed) {
+        // Fast 300ms polling when waiting for opponent move!
+        // 800ms when waiting for user to move or game is ended
+        const isWaitingForOpponent = roomStatus === 'playing' && currentRoomTurn !== myOnlineRole && !isOnlineGameOver;
+        const intervalMs = isWaitingForOpponent ? 300 : 800;
+        pollTimer = setTimeout(fetchRoomState, intervalMs);
+      }
+    };
 
-  // ----------------- ONLINE MOVE ACTIONS -----------------
+    fetchRoomState();
+
+    return () => {
+      isSubscribed = false;
+      clearTimeout(pollTimer);
+    };
+  }, [mode, roomId, playerId, myOnlineRole, isOnlineGameOver, currentRoomTurn, roomStatus]);
+
+  // ----------------- ONLINE MOVE ACTIONS (OPTIMISTIC 0MS RESPONSE) -----------------
 
   const handleOnlineMove = async (r: number, c: number) => {
     if (!onlineRoom || onlineRoom.status !== 'playing' || onlineRoom.isGameOver) return;
     if (onlineRoom.currentTurn !== myOnlineRole) return;
+    if (onlineRoom.board[r][c] !== null) return;
 
+    // 1. Instant sound feedback on tap
     sounds.playStoneClack();
 
+    const myRole = myOnlineRole;
+    const opponentRole: StoneColor = myRole === 'B' ? 'W' : 'B';
+    const flipped = getFlippedStones(onlineRoom.board, r, c, myRole);
+    if (flipped.length > 0) {
+      sounds.playFlipStone(flipped.length);
+    }
+
+    // 2. Instant Optimistic Board Update (0ms delay on player's screen!)
+    const optimisticBoard = applyMove(onlineRoom.board, r, c, myRole);
+    const counts = countStones(optimisticBoard);
+    const prevRoomSnapshot = onlineRoom;
+
+    setOnlineRoom((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        board: optimisticBoard,
+        currentTurn: opponentRole,
+        blackCount: counts.black,
+        whiteCount: counts.white,
+        lastMove: { r, c, player: myRole },
+        lastFlipped: flipped,
+        turnStartTime: Date.now(),
+      };
+    });
+    setTurnTimeLeft(45);
+
+    // 3. Dispatch move to server
     try {
       const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
         method: 'POST',
@@ -365,14 +433,15 @@ function GameApp() {
       const data = await res.json();
       if (data.success && data.room) {
         setOnlineRoom(data.room);
-        if (data.room.lastFlipped.length > 0) {
-          sounds.playFlipStone(data.room.lastFlipped.length);
-        }
       } else {
+        // Rollback on rejection
+        setOnlineRoom(prevRoomSnapshot);
         sounds.playInvalid();
       }
     } catch (err) {
-      console.error(err);
+      console.error('Online move error:', err);
+      setOnlineRoom(prevRoomSnapshot);
+      sounds.playInvalid();
     }
   };
 

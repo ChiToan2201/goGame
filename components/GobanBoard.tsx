@@ -115,10 +115,17 @@ export const GobanBoard: React.FC<GobanBoardProps> = ({
                 return (
                   <div
                     key={`cell-${r}-${c}`}
-                    className="relative w-full h-full aspect-square flex items-center justify-center cursor-pointer overflow-visible"
+                    className="relative w-full h-full aspect-square flex items-center justify-center cursor-pointer overflow-visible select-none touch-manipulation active:scale-[0.96] transition-transform"
+                    style={{ touchAction: 'manipulation' }}
                     onClick={() => handleCellClick(r, c)}
-                    onMouseEnter={() => setHoveredCell({ r, c })}
-                    onMouseLeave={() => setHoveredCell(null)}
+                    onPointerEnter={(e) => {
+                      // Only show hover preview on actual mouse/stylus devices, never sticky on mobile finger touch
+                      if (e.pointerType !== 'touch') {
+                        setHoveredCell({ r, c });
+                      }
+                    }}
+                    onPointerLeave={() => setHoveredCell(null)}
+                    onPointerCancel={() => setHoveredCell(null)}
                   >
                     {/* Horizontal Go Grid Line */}
                     <div

@@ -70,6 +70,7 @@ export interface QueuedPlayer {
 declare global {
   var __FLANK_GAME_ROOMS: Map<string, GameRoom> | undefined;
   var __FLANK_MATCH_QUEUE: QueuedPlayer[] | undefined;
+  var __FLANK_MATCH_RESULTS: Map<string, { roomId: string; matchedAt: number }> | undefined;
 }
 
 if (!globalThis.__FLANK_GAME_ROOMS) {
@@ -78,9 +79,13 @@ if (!globalThis.__FLANK_GAME_ROOMS) {
 if (!globalThis.__FLANK_MATCH_QUEUE) {
   globalThis.__FLANK_MATCH_QUEUE = [];
 }
+if (!globalThis.__FLANK_MATCH_RESULTS) {
+  globalThis.__FLANK_MATCH_RESULTS = new Map<string, { roomId: string; matchedAt: number }>();
+}
 
 const rooms = globalThis.__FLANK_GAME_ROOMS;
 const matchQueue = globalThis.__FLANK_MATCH_QUEUE;
+const matchResults = globalThis.__FLANK_MATCH_RESULTS;
 
 function generateCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -487,76 +492,110 @@ export const multiplayerStore = {
     status: 'queued' | 'matched';
     roomId?: string;
   } {
-    // Check if player is already assigned a room
-    const existing = matchQueue.find((q) => q.playerId === player.id);
-    if (existing?.assignedRoomId) {
-      const roomId = existing.assignedRoomId;
-      // Remove from queue
-      const idx = matchQueue.indexOf(existing);
-      if (idx !== -1) matchQueue.splice(idx, 1);
-      return { status: 'matched', roomId };
+    const now = Date.now();
+
+    // 1. Check if this player already has an existing valid match result
+    const recentMatch = matchResults.get(player.id);
+    if (recentMatch && now - recentMatch.matchedAt < 45000) {
+      return { status: 'matched', roomId: recentMatch.roomId };
     }
 
-    // Clean queue of players older than 60s
-    const now = Date.now();
+    // 2. Clean stale match queue entries older than 45 seconds
     for (let i = matchQueue.length - 1; i >= 0; i--) {
-      if (now - matchQueue[i].joinedAt > 60000) {
+      if (now - matchQueue[i].joinedAt > 45000) {
         matchQueue.splice(i, 1);
       }
     }
 
-    // Check if another waiting player is in queue
-    const otherPlayer = matchQueue.find((q) => q.playerId !== player.id && !q.assignedRoomId);
+    // 3. Clean stale match results
+    for (const [pid, res] of matchResults.entries()) {
+      if (now - res.matchedAt > 60000) {
+        matchResults.delete(pid);
+      }
+    }
 
-    if (otherPlayer) {
-      // Pair them up!
+    // 4. Check if player was already assigned a room in queue
+    const existing = matchQueue.find((q) => q.playerId === player.id);
+    if (existing?.assignedRoomId) {
+      const rId = existing.assignedRoomId;
+      matchResults.set(player.id, { roomId: rId, matchedAt: now });
+      const idx = matchQueue.indexOf(existing);
+      if (idx !== -1) matchQueue.splice(idx, 1);
+      return { status: 'matched', roomId: rId };
+    }
+
+    // 5. Look for any waiting opponent (different player ID)
+    const opponentIndex = matchQueue.findIndex((q) => q.playerId !== player.id && !q.assignedRoomId);
+
+    if (opponentIndex !== -1) {
+      const opponent = matchQueue[opponentIndex];
+      // Create matched room with random host side
       const room = this.createRoom(
-        { id: otherPlayer.playerId, name: otherPlayer.playerName, avatar: otherPlayer.avatar },
+        { id: opponent.playerId, name: opponent.playerName, avatar: opponent.avatar },
         false
       );
 
-      // Join the second player
+      // Join the current second player into the room
       this.joinRoom(room.id, {
         id: player.id,
         name: player.name,
         avatar: player.avatar,
       });
 
-      // Mark first player as matched
-      otherPlayer.assignedRoomId = room.id;
+      // Cache match results for BOTH players so polling never misses it!
+      matchResults.set(opponent.playerId, { roomId: room.id, matchedAt: now });
+      matchResults.set(player.id, { roomId: room.id, matchedAt: now });
 
-      // Remove current player from queue if present
+      // Mark and remove opponent from queue
+      opponent.assignedRoomId = room.id;
+      matchQueue.splice(opponentIndex, 1);
+
+      // Remove current player if somehow present
       const currIdx = matchQueue.findIndex((q) => q.playerId === player.id);
       if (currIdx !== -1) matchQueue.splice(currIdx, 1);
 
       return { status: 'matched', roomId: room.id };
     }
 
-    // No waiting opponent yet, add to queue if not present
+    // 6. No waiting opponent yet, add or refresh in queue
     if (!existing) {
       matchQueue.push({
         playerId: player.id,
         playerName: player.name,
-        avatar: player.avatar || '⚡',
-        joinedAt: Date.now(),
+        avatar: player.avatar || '🥋',
+        joinedAt: now,
       });
+    } else {
+      existing.joinedAt = now;
     }
 
     return { status: 'queued' };
   },
 
   checkMatchmaking(playerId: string): { status: 'queued' | 'matched' | 'not_found'; roomId?: string } {
-    const entry = matchQueue.find((q) => q.playerId === playerId);
-    if (!entry) return { status: 'not_found' };
+    const now = Date.now();
 
-    if (entry.assignedRoomId) {
-      const roomId = entry.assignedRoomId;
-      const idx = matchQueue.indexOf(entry);
-      if (idx !== -1) matchQueue.splice(idx, 1);
-      return { status: 'matched', roomId };
+    // 1. Check match results cache first (guaranteed delivery!)
+    const recent = matchResults.get(playerId);
+    if (recent && now - recent.matchedAt < 45000) {
+      return { status: 'matched', roomId: recent.roomId };
     }
 
-    return { status: 'queued' };
+    // 2. Check if assigned in matchQueue
+    const entry = matchQueue.find((q) => q.playerId === playerId);
+    if (entry?.assignedRoomId) {
+      const rId = entry.assignedRoomId;
+      matchResults.set(playerId, { roomId: rId, matchedAt: now });
+      const idx = matchQueue.indexOf(entry);
+      if (idx !== -1) matchQueue.splice(idx, 1);
+      return { status: 'matched', roomId: rId };
+    }
+
+    if (entry) {
+      return { status: 'queued' };
+    }
+
+    return { status: 'not_found' };
   },
 
   removeFromMatchmaking(playerId: string) {
@@ -564,5 +603,6 @@ export const multiplayerStore = {
     if (idx !== -1) {
       matchQueue.splice(idx, 1);
     }
+    matchResults.delete(playerId);
   },
 };
