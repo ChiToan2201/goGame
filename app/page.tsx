@@ -367,14 +367,18 @@ function GameApp() {
           const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
           setTurnTimeLeft(remaining);
 
-          // Auto-close matchmaking popup and show game start
+          // Auto-close matchmaking/waiting and show game start
           if (room.status === 'playing' && onlineRoom?.status !== 'playing') {
             setShowGameStart(true);
             setTimeout(() => setShowGameStart(false), 3000);
             if (isMatchmaking) setIsMatchmaking(false);
           }
-          if (room.playerBlack && room.playerWhite && isMatchmaking) {
-             setIsMatchmaking(false);
+          
+          // Handle disconnection immediately
+          if (room.status === 'playing' && 
+              ((onlineRoom?.playerBlack?.connected && !room.playerBlack?.connected) ||
+               (onlineRoom?.playerWhite?.connected && !room.playerWhite?.connected))) {
+            // Server should have triggered surrender, we just update UI
           }
 
           setOnlineRoom(room);
