@@ -12,6 +12,7 @@ import {
   VolumeX,
   HelpCircle,
   ArrowRight,
+  Loader2,
 } from 'lucide-react';
 import {
   BoardState,
@@ -22,6 +23,7 @@ import {
   applyMove,
   countStones,
   getAIMove,
+  getFlippedStones,
   AIDifficulty,
   sounds,
 } from '@/lib/game-engine';
@@ -129,6 +131,7 @@ function GameApp() {
 
   // Matchmaking State
   const [isMatchmaking, setIsMatchmaking] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
   // Online Room State
   const [onlineRoom, setOnlineRoom] = useState<GameRoom | null>(null);
@@ -178,7 +181,7 @@ function GameApp() {
         return;
       }
       setJoinError('');
-
+      setIsLoading(true);
       try {
         const res = await fetch('/api/rooms', {
           method: 'POST',
@@ -203,12 +206,15 @@ function GameApp() {
       } catch (err) {
         console.error(err);
         setJoinError('Lỗi kết nối tới phòng');
+      } finally {
+        setIsLoading(false);
       }
     },
     [joinCodeInput, playerId, playerName, avatar]
   );
 
   const createCustomRoom = async () => {
+    setIsLoading(true);
     try {
       const res = await fetch('/api/rooms', {
         method: 'POST',
@@ -228,6 +234,8 @@ function GameApp() {
       }
     } catch (err) {
       console.error(err);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -399,7 +407,9 @@ function GameApp() {
     }
 
     // 2. Instant Optimistic Board Update (0ms delay on player's screen!)
-    const optimisticBoard = applyMove(onlineRoom.board, r, c, myRole);
+    const moveResult = applyMove(onlineRoom.board, r, c, myRole);
+    if (!moveResult) return;
+    const optimisticBoard = moveResult.newBoard;
     const counts = countStones(optimisticBoard);
     const prevRoomSnapshot = onlineRoom;
 
@@ -1155,6 +1165,13 @@ function GameApp() {
         }}
         onExit={handleExitToLobby}
       />
+
+      {/* Loading Overlay */}
+      {isLoading && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-sm">
+          <Loader2 className="w-10 h-10 animate-spin text-white" />
+        </div>
+      )}
     </main>
   );
 }
