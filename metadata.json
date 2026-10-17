@@ -1,0 +1,6 @@
+{
+  "name": "Cờ Vây Kẹp Quân Online",
+  "description": "Game cờ vây kẹp quân online đối kháng thời gian thực. Ghép trận nhanh với người chơi khác, tạo phòng mời bạn bè, thách đấu AI thông minh trên bàn cờ gỗ tuyệt đẹp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
