@@ -18,6 +18,9 @@ export const viewport: Viewport = {
 export const metadata: Metadata = {
   title: 'Cờ Vây Kẹp Quân Online - Đối Kháng Thời Gian Thực',
   description: 'Game cờ vây kẹp quân online đối kháng thời gian thực. Giới hạn 45 giây mỗi lượt, xử thua khi hết giờ.',
+  icons: {
+    icon: '/favicon.ico',
+  },
   openGraph: {
     title: 'Cờ Vây Kẹp Quân Online',
     description: 'Game cờ vây kẹp quân đối kháng online thời gian thực. Ghép trận nhanh, chơi cùng bạn bè hoặc thách đấu AI.',

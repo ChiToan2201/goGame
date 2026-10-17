@@ -131,6 +131,7 @@ function GameApp() {
 
   // Matchmaking State
   const [isMatchmaking, setIsMatchmaking] = useState(false);
+  const [showGameStart, setShowGameStart] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
   // Online Room State
@@ -366,6 +367,16 @@ function GameApp() {
           const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
           setTurnTimeLeft(remaining);
 
+          // Auto-close matchmaking popup and show game start
+          if (room.status === 'playing' && onlineRoom?.status !== 'playing') {
+            setShowGameStart(true);
+            setTimeout(() => setShowGameStart(false), 3000);
+            if (isMatchmaking) setIsMatchmaking(false);
+          }
+          if (room.playerBlack && room.playerWhite && isMatchmaking) {
+             setIsMatchmaking(false);
+          }
+
           setOnlineRoom(room);
         }
       } catch (err) {
@@ -387,7 +398,7 @@ function GameApp() {
       isSubscribed = false;
       clearTimeout(pollTimer);
     };
-  }, [mode, roomId, playerId, myOnlineRole, isOnlineGameOver, currentRoomTurn, roomStatus]);
+  }, [mode, roomId, playerId, myOnlineRole, isOnlineGameOver, currentRoomTurn, roomStatus, isMatchmaking, onlineRoom?.status]);
 
   // ----------------- ONLINE MOVE ACTIONS (OPTIMISTIC 0MS RESPONSE) -----------------
 
@@ -1114,6 +1125,15 @@ function GameApp() {
 
       {/* 3. Rules Modal */}
       <RulesModal isOpen={showRules} onClose={() => setShowRules(false)} />
+
+      {/* Game Start Notification */}
+      {showGameStart && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center pointer-events-none">
+          <div className="bg-green-600 text-white px-8 py-4 rounded-full text-2xl font-bold animate-pulse shadow-lg">
+            BẮT ĐẦU
+          </div>
+        </div>
+      )}
 
       {/* 4. Game Over Modal */}
       <GameOverModal
