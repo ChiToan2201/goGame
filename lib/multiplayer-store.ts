@@ -164,16 +164,38 @@ export const multiplayerStore = {
       const elapsedSeconds = (now - room.turnStartTime) / 1000;
       if (elapsedSeconds > room.turnDurationSeconds) {
         this.surrender(cleanId, room.currentTurn === 'B' ? (room.playerBlack?.id || '') : (room.playerWhite?.id || ''));
-      } else if (room.playerBlack?.connected && room.playerBlack.lastHeartbeat && now - room.playerBlack.lastHeartbeat > 15000) {
+      } else if (room.playerBlack?.connected && room.playerBlack.lastHeartbeat && now - room.playerBlack.lastHeartbeat > 10000) {
         room.playerBlack.connected = false;
         this.surrender(cleanId, room.playerBlack.id);
-      } else if (room.playerWhite?.connected && room.playerWhite.lastHeartbeat && now - room.playerWhite.lastHeartbeat > 15000) {
+      } else if (room.playerWhite?.connected && room.playerWhite.lastHeartbeat && now - room.playerWhite.lastHeartbeat > 10000) {
         room.playerWhite.connected = false;
         this.surrender(cleanId, room.playerWhite.id);
       }
     }
 
     return room;
+  },
+
+  leaveRoom(roomId: string, playerId: string): { success: boolean; room?: GameRoom } {
+    const room = this.getRoom(roomId);
+    if (!room) return { success: false };
+
+    // If game is in progress, treat as surrender
+    if (room.status === 'playing' && !room.isGameOver) {
+      this.surrender(roomId, playerId);
+    }
+
+    // If spectator, remove from spectator list
+    const specIdx = room.spectators.findIndex(s => s.id === playerId);
+    if (specIdx !== -1) {
+      room.spectators.splice(specIdx, 1);
+    }
+
+    // Mark disconnected
+    if (room.playerBlack?.id === playerId) room.playerBlack.connected = false;
+    if (room.playerWhite?.id === playerId) room.playerWhite.connected = false;
+
+    return { success: true, room };
   },
 
   joinRoom(

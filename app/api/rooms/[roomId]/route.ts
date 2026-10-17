@@ -74,6 +74,11 @@ export async function POST(
       return NextResponse.json({ success: true, room: result.room });
     }
 
+    if (action === 'leave') {
+      const result = multiplayerStore.leaveRoom(roomId, playerId);
+      return NextResponse.json(result);
+    }
+
     return NextResponse.json({ error: 'Action không hợp lệ' }, { status: 400 });
   } catch (error) {
     console.error('Room action error:', error);

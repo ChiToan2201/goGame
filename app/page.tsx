@@ -370,8 +370,9 @@ function GameApp() {
           // Auto-close matchmaking/waiting and show game start
           if (room.status === 'playing' && onlineRoom?.status !== 'playing') {
             setShowGameStart(true);
-            setTimeout(() => setShowGameStart(false), 3000);
+            setTimeout(() => setShowGameStart(false), 1500);
             if (isMatchmaking) setIsMatchmaking(false);
+            setShowShareModal(false);
           }
           
           // Handle disconnection immediately
@@ -710,8 +711,21 @@ function GameApp() {
     return () => clearInterval(interval);
   }, [mode, currentTurn, isGameOver]);
 
-  // Return to Lobby
-  const handleExitToLobby = () => {
+  const handleExitToLobby = async () => {
+    if (mode === 'online_room' && onlineRoom) {
+      try {
+        await fetch(`/api/rooms/${onlineRoom.id}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'leave',
+            playerId,
+          }),
+        });
+      } catch (err) {
+        console.error('Error leaving room:', err);
+      }
+    }
     setMode('lobby');
     setOnlineRoom(null);
     setMyOnlineRole(null);
@@ -1133,7 +1147,7 @@ function GameApp() {
       {/* Game Start Notification */}
       {showGameStart && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center pointer-events-none">
-          <div className="bg-green-600 text-white px-8 py-4 rounded-full text-2xl font-bold animate-pulse shadow-lg">
+          <div className="bg-green-600 text-white px-8 py-4 rounded-full text-2xl font-bold animate-start-fade-out shadow-lg">
             BẮT ĐẦU
           </div>
         </div>
