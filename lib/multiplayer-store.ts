@@ -159,28 +159,17 @@ export const multiplayerStore = {
     if (!room) return null;
 
     // Check timer expiration if playing
+    const now = Date.now();
     if (room.status === 'playing' && !room.isGameOver) {
-      const elapsedSeconds = (Date.now() - room.turnStartTime) / 1000;
+      const elapsedSeconds = (now - room.turnStartTime) / 1000;
       if (elapsedSeconds > room.turnDurationSeconds) {
-        // Current player timed out! Opponent gets automatic win or turn pass
-        const timeoutPlayer = room.currentTurn;
-        const winner = timeoutPlayer === 'B' ? 'W' : 'B';
-        const timedOutName =
-          timeoutPlayer === 'B'
-            ? room.playerBlack?.name ?? 'Đen'
-            : room.playerWhite?.name ?? 'Trắng';
-
-        room.isGameOver = true;
-        room.status = 'ended';
-        room.winner = winner;
-        room.winReason = `Hết giờ! ${timedOutName} quá 45 giây suy nghĩ và bị xử thua!`;
-        room.chatMessages.push({
-          id: `timeout-${Date.now()}`,
-          senderName: 'Trọng Tài',
-          senderId: 'sys',
-          text: `⏱️ Hết thời gian 45 giây! ${timedOutName} bị xử thua. ${winner === 'B' ? 'Quân Đen' : 'Quân Trắng'} thắng!`,
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        });
+        this.surrender(cleanId, room.currentTurn === 'B' ? (room.playerBlack?.id || '') : (room.playerWhite?.id || ''));
+      } else if (room.playerBlack?.connected && room.playerBlack.lastHeartbeat && now - room.playerBlack.lastHeartbeat > 15000) {
+        room.playerBlack.connected = false;
+        this.surrender(cleanId, room.playerBlack.id);
+      } else if (room.playerWhite?.connected && room.playerWhite.lastHeartbeat && now - room.playerWhite.lastHeartbeat > 15000) {
+        room.playerWhite.connected = false;
+        this.surrender(cleanId, room.playerWhite.id);
       }
     }
 
