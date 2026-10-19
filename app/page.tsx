@@ -1599,7 +1599,7 @@ function GameApp() {
         <span className="hidden sm:inline">•</span>
         <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-[#EAE2D2] text-[#4A4237] rounded-full font-mono text-[11px] font-bold border border-[#D5CCBC] shadow-2xs">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse" />
-          Phiên bản v2.5.0
+          Phiên bản v1.1
         </span>
       </footer>
     </main>
