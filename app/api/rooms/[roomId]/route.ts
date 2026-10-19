@@ -10,13 +10,14 @@ export async function GET(
     const { searchParams } = new URL(req.url);
     const playerId = searchParams.get('playerId');
 
+    // Register heartbeat first so the room timer sees an active connection
+    if (playerId) {
+      multiplayerStore.heartbeat(roomId, playerId);
+    }
+
     const room = multiplayerStore.getRoom(roomId);
     if (!room) {
       return NextResponse.json({ error: 'Phòng không tồn tại' }, { status: 404 });
-    }
-
-    if (playerId) {
-      multiplayerStore.heartbeat(roomId, playerId);
     }
 
     return NextResponse.json({ success: true, room });
@@ -38,6 +39,9 @@ export async function POST(
     if (!playerId) {
       return NextResponse.json({ error: 'Thiếu thông tin người chơi' }, { status: 400 });
     }
+
+    // Refresh heartbeat on any player interaction
+    multiplayerStore.heartbeat(roomId, playerId);
 
     if (action === 'move') {
       if (typeof r !== 'number' || typeof c !== 'number') {

@@ -5,8 +5,9 @@ import {
   countStones,
   StoneColor,
   Position,
-  getValidMoves,
 } from './game-engine';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export interface PlayerInfo {
   id: string;
@@ -87,6 +88,39 @@ const rooms = globalThis.__FLANK_GAME_ROOMS;
 const matchQueue = globalThis.__FLANK_MATCH_QUEUE;
 const matchResults = globalThis.__FLANK_MATCH_RESULTS;
 
+// Cross-process file system fallback cache for persistent serverless environments
+const PERSISTENCE_FILE = path.join(process.env.TEMP || '/tmp', 'flank_game_rooms.json');
+
+function saveToDisk() {
+  try {
+    const data = JSON.stringify(Array.from(rooms.entries()));
+    fs.writeFileSync(PERSISTENCE_FILE, data, 'utf-8');
+  } catch {
+    // Non-fatal if filesystem is restricted
+  }
+}
+
+function loadFromDisk() {
+  try {
+    if (fs.existsSync(PERSISTENCE_FILE)) {
+      const data = fs.readFileSync(PERSISTENCE_FILE, 'utf-8');
+      const entries = JSON.parse(data) as [string, GameRoom][];
+      if (Array.isArray(entries)) {
+        for (const [k, v] of entries) {
+          if (!rooms.has(k)) {
+            rooms.set(k, v);
+          }
+        }
+      }
+    }
+  } catch {
+    // Safe ignore
+  }
+}
+
+// Initial restore
+loadFromDisk();
+
 function generateCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -150,24 +184,40 @@ export const multiplayerStore = {
     };
 
     rooms.set(roomId, room);
+    saveToDisk();
     return room;
   },
 
   getRoom(roomId: string): GameRoom | null {
     const cleanId = roomId.toUpperCase();
-    const room = rooms.get(cleanId);
+    let room = rooms.get(cleanId);
+    if (!room) {
+      loadFromDisk();
+      room = rooms.get(cleanId);
+    }
     if (!room) return null;
 
-    // Check timer expiration if playing
+    // Check timer expiration and disconnections if game is actively playing
     const now = Date.now();
     if (room.status === 'playing' && !room.isGameOver) {
       const elapsedSeconds = (now - room.turnStartTime) / 1000;
+      // 45s turn timeout
       if (elapsedSeconds > room.turnDurationSeconds) {
         this.surrender(cleanId, room.currentTurn === 'B' ? (room.playerBlack?.id || '') : (room.playerWhite?.id || ''));
-      } else if (room.playerBlack?.connected && room.playerBlack.lastHeartbeat && now - room.playerBlack.lastHeartbeat > 10000) {
+      } else if (
+        room.playerBlack?.connected &&
+        room.playerBlack.lastHeartbeat &&
+        now - room.playerBlack.lastHeartbeat > 40000
+      ) {
+        // Disconnected for more than 40 seconds
         room.playerBlack.connected = false;
         this.surrender(cleanId, room.playerBlack.id);
-      } else if (room.playerWhite?.connected && room.playerWhite.lastHeartbeat && now - room.playerWhite.lastHeartbeat > 10000) {
+      } else if (
+        room.playerWhite?.connected &&
+        room.playerWhite.lastHeartbeat &&
+        now - room.playerWhite.lastHeartbeat > 40000
+      ) {
+        // Disconnected for more than 40 seconds
         room.playerWhite.connected = false;
         this.surrender(cleanId, room.playerWhite.id);
       }
@@ -177,24 +227,26 @@ export const multiplayerStore = {
   },
 
   leaveRoom(roomId: string, playerId: string): { success: boolean; room?: GameRoom } {
-    const room = this.getRoom(roomId);
+    const cleanId = roomId.toUpperCase();
+    const room = this.getRoom(cleanId);
     if (!room) return { success: false };
-
-    // If game is in progress, treat as surrender
-    if (room.status === 'playing' && !room.isGameOver) {
-      this.surrender(roomId, playerId);
-    }
-
-    // If spectator, remove from spectator list
-    const specIdx = room.spectators.findIndex(s => s.id === playerId);
-    if (specIdx !== -1) {
-      room.spectators.splice(specIdx, 1);
-    }
 
     // Mark disconnected
     if (room.playerBlack?.id === playerId) room.playerBlack.connected = false;
     if (room.playerWhite?.id === playerId) room.playerWhite.connected = false;
 
+    // If game was playing, immediate surrender
+    if (room.status === 'playing' && !room.isGameOver) {
+      this.surrender(cleanId, playerId);
+    }
+
+    // Remove spectator if applicable
+    const specIdx = room.spectators.findIndex(s => s.id === playerId);
+    if (specIdx !== -1) {
+      room.spectators.splice(specIdx, 1);
+    }
+
+    saveToDisk();
     return { success: true, room };
   },
 
@@ -203,22 +255,29 @@ export const multiplayerStore = {
     player: { id: string; name: string; avatar?: string }
   ): { room: GameRoom; role: 'B' | 'W' | 'spectator' } | { error: string } {
     const cleanId = roomId.toUpperCase();
-    const room = rooms.get(cleanId);
+    let room = rooms.get(cleanId);
+    if (!room) {
+      loadFromDisk();
+      room = rooms.get(cleanId);
+    }
     if (!room) {
       return { error: 'Không tìm thấy phòng với mã này' };
     }
 
     room.lastActive = Date.now();
+    const now = Date.now();
 
     // Check if player is already registered in this room
     if (room.playerBlack?.id === player.id) {
       room.playerBlack.connected = true;
-      room.playerBlack.lastHeartbeat = Date.now();
+      room.playerBlack.lastHeartbeat = now;
+      saveToDisk();
       return { room, role: 'B' };
     }
     if (room.playerWhite?.id === player.id) {
       room.playerWhite.connected = true;
-      room.playerWhite.lastHeartbeat = Date.now();
+      room.playerWhite.lastHeartbeat = now;
+      saveToDisk();
       return { room, role: 'W' };
     }
 
@@ -228,36 +287,51 @@ export const multiplayerStore = {
       name: player.name.trim() || 'Người chơi 2',
       avatar: player.avatar || '⚔️',
       connected: true,
-      lastHeartbeat: Date.now(),
+      lastHeartbeat: now,
     };
 
     if (!room.playerBlack) {
       room.playerBlack = pInfo;
       if (room.playerWhite) {
         room.status = 'playing';
-        room.turnStartTime = Date.now();
+        room.turnStartTime = now;
+        // IMPORTANT: Reset heartbeats for both players to prevent premature surrender
+        room.playerBlack.lastHeartbeat = now;
+        room.playerBlack.connected = true;
+        room.playerWhite.lastHeartbeat = now;
+        room.playerWhite.connected = true;
       }
       room.chatMessages.push({
-        id: `join-${Date.now()}`,
+        id: `join-${now}`,
         senderName: 'Hệ Thống',
         senderId: 'sys',
-        text: `${pInfo.name} đã tham gia với tư cách Quân Đen!`,
+        text: `${pInfo.name} đã tham gia với tư cách Quân Đen! Trận đấu bắt đầu!`,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       });
+      saveToDisk();
       return { room, role: 'B' };
     }
 
     if (!room.playerWhite) {
       room.playerWhite = pInfo;
       room.status = 'playing';
-      room.turnStartTime = Date.now();
+      room.turnStartTime = now;
+      // IMPORTANT: Reset heartbeats for both players to prevent premature surrender
+      if (room.playerBlack) {
+        room.playerBlack.lastHeartbeat = now;
+        room.playerBlack.connected = true;
+      }
+      room.playerWhite.lastHeartbeat = now;
+      room.playerWhite.connected = true;
+
       room.chatMessages.push({
-        id: `join-${Date.now()}`,
+        id: `join-${now}`,
         senderName: 'Hệ Thống',
         senderId: 'sys',
         text: `${pInfo.name} đã tham gia với tư cách Quân Trắng! Trận đấu bắt đầu!`,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       });
+      saveToDisk();
       return { room, role: 'W' };
     }
 
@@ -266,6 +340,7 @@ export const multiplayerStore = {
     if (!existingSpec) {
       room.spectators.push(pInfo);
     }
+    saveToDisk();
     return { room, role: 'spectator' };
   },
 
@@ -275,8 +350,17 @@ export const multiplayerStore = {
     r: number,
     c: number
   ): { success: boolean; error?: string; room?: GameRoom } {
+    // 1. Immediately register heartbeat before checking state
+    this.heartbeat(roomId, playerId);
+
     const room = this.getRoom(roomId);
     if (!room) return { success: false, error: 'Phòng không tồn tại' };
+
+    // Auto-transition to playing if both players exist
+    if (room.status === 'waiting' && room.playerBlack && room.playerWhite) {
+      room.status = 'playing';
+      room.turnStartTime = Date.now();
+    }
 
     if (room.status !== 'playing' || room.isGameOver) {
       return { success: false, error: 'Trận đấu chưa bắt đầu hoặc đã kết thúc' };
@@ -304,6 +388,7 @@ export const multiplayerStore = {
       };
     }
 
+    const now = Date.now();
     // Update room state
     room.board = moveRes.newBoard;
     room.currentTurn = moveRes.nextColor;
@@ -313,15 +398,19 @@ export const multiplayerStore = {
     room.whiteCount = moveRes.whiteCount;
     room.lastMove = { r, c, player: playerColor };
     room.lastFlipped = moveRes.flipped;
-    room.turnStartTime = Date.now();
-    room.lastActive = Date.now();
+    room.turnStartTime = now;
+    room.lastActive = now;
+
+    // Keep heartbeat fresh
+    if (playerColor === 'B' && room.playerBlack) room.playerBlack.lastHeartbeat = now;
+    if (playerColor === 'W' && room.playerWhite) room.playerWhite.lastHeartbeat = now;
 
     room.moveHistory.push({
       player: playerColor,
       r,
       c,
       flippedCount: moveRes.flipped.length,
-      timestamp: Date.now(),
+      timestamp: now,
     });
 
     if (moveRes.isGameOver) {
@@ -340,7 +429,7 @@ export const multiplayerStore = {
             } quân!`;
 
       room.chatMessages.push({
-        id: `gameover-${Date.now()}`,
+        id: `gameover-${now}`,
         senderName: 'Hệ Thống',
         senderId: 'sys',
         text: `🏆 Trận đấu kết thúc! ${room.winReason}`,
@@ -348,6 +437,7 @@ export const multiplayerStore = {
       });
     }
 
+    saveToDisk();
     return { success: true, room };
   },
 
@@ -355,8 +445,9 @@ export const multiplayerStore = {
     roomId: string,
     playerId: string
   ): { success: boolean; room?: GameRoom; error?: string } {
-    const room = this.getRoom(roomId);
-    if (!room || room.status !== 'playing' || room.isGameOver) {
+    const cleanId = roomId.toUpperCase();
+    const room = rooms.get(cleanId);
+    if (!room || room.isGameOver) {
       return { success: false, error: 'Không thể đầu hàng lúc này' };
     }
 
@@ -364,12 +455,12 @@ export const multiplayerStore = {
       room.isGameOver = true;
       room.status = 'ended';
       room.winner = 'W';
-      room.winReason = `${room.playerBlack.name} đã xin nhận thua!`;
+      room.winReason = `${room.playerBlack.name} đã rời trận / nhận thua! Quân Trắng chiến thắng!`;
     } else if (room.playerWhite?.id === playerId) {
       room.isGameOver = true;
       room.status = 'ended';
       room.winner = 'B';
-      room.winReason = `${room.playerWhite.name} đã xin nhận thua!`;
+      room.winReason = `${room.playerWhite.name} đã rời trận / nhận thua! Quân Đen chiến thắng!`;
     } else {
       return { success: false, error: 'Người chơi không hợp lệ' };
     }
@@ -382,6 +473,7 @@ export const multiplayerStore = {
       time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     });
 
+    saveToDisk();
     return { success: true, room };
   },
 
@@ -389,7 +481,8 @@ export const multiplayerStore = {
     roomId: string,
     playerId: string
   ): { success: boolean; room?: GameRoom; error?: string } {
-    const room = this.getRoom(roomId);
+    const cleanId = roomId.toUpperCase();
+    const room = this.getRoom(cleanId);
     if (!room) return { success: false, error: 'Phòng không tồn tại' };
 
     if (room.playerBlack?.id === playerId) {
@@ -408,6 +501,10 @@ export const multiplayerStore = {
       oldBlack.rematchRequested = false;
       oldWhite.rematchRequested = false;
 
+      const now = Date.now();
+      oldBlack.lastHeartbeat = now;
+      oldWhite.lastHeartbeat = now;
+
       room.playerBlack = oldWhite;
       room.playerWhite = oldBlack;
       room.board = createInitialBoard(8);
@@ -422,10 +519,10 @@ export const multiplayerStore = {
       room.moveHistory = [];
       room.lastMove = null;
       room.lastFlipped = [];
-      room.turnStartTime = Date.now();
+      room.turnStartTime = now;
 
       room.chatMessages.push({
-        id: `rematch-start-${Date.now()}`,
+        id: `rematch-start-${now}`,
         senderName: 'Hệ Thống',
         senderId: 'sys',
         text: `🔄 Cả hai đã đồng ý tái đấu! Đổi quân cờ và bắt đầu ván mới!`,
@@ -445,6 +542,7 @@ export const multiplayerStore = {
       });
     }
 
+    saveToDisk();
     return { success: true, room };
   },
 
@@ -453,7 +551,8 @@ export const multiplayerStore = {
     senderId: string,
     text: string
   ): { success: boolean; room?: GameRoom } {
-    const room = this.getRoom(roomId);
+    const cleanId = roomId.toUpperCase();
+    const room = this.getRoom(cleanId);
     if (!room) return { success: false };
 
     let senderName = 'Khán giả';
@@ -482,18 +581,25 @@ export const multiplayerStore = {
       room.chatMessages.shift();
     }
 
+    saveToDisk();
     return { success: true, room };
   },
 
   heartbeat(roomId: string, playerId: string) {
-    const room = rooms.get(roomId.toUpperCase());
+    const cleanId = roomId.toUpperCase();
+    let room = rooms.get(cleanId);
+    if (!room) {
+      loadFromDisk();
+      room = rooms.get(cleanId);
+    }
     if (!room) return;
-    room.lastActive = Date.now();
+    const now = Date.now();
+    room.lastActive = now;
     if (room.playerBlack?.id === playerId) {
-      room.playerBlack.lastHeartbeat = Date.now();
+      room.playerBlack.lastHeartbeat = now;
       room.playerBlack.connected = true;
     } else if (room.playerWhite?.id === playerId) {
-      room.playerWhite.lastHeartbeat = Date.now();
+      room.playerWhite.lastHeartbeat = now;
       room.playerWhite.connected = true;
     }
   },

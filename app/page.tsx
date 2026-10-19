@@ -13,6 +13,7 @@ import {
   HelpCircle,
   ArrowRight,
   Loader2,
+  Sparkles,
 } from 'lucide-react';
 import {
   BoardState,
@@ -28,6 +29,7 @@ import {
   sounds,
 } from '@/lib/game-engine';
 import { GameRoom } from '@/lib/multiplayer-store';
+import { P2PGameSync } from '@/lib/p2p-sync';
 import { GobanBoard } from '@/components/GobanBoard';
 import { GameHeader } from '@/components/GameHeader';
 import { MatchmakingModal } from '@/components/MatchmakingModal';
@@ -109,7 +111,6 @@ function GameApp() {
 
   const [playerId] = useState(() => {
     if (typeof window === 'undefined') return 'user_init';
-    // Use sessionStorage so multiple browser tabs have distinct player IDs for multiplayer testing
     let pid = sessionStorage.getItem('flank_player_session_id');
     if (!pid) {
       pid = 'user_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
@@ -124,6 +125,7 @@ function GameApp() {
   const [showRules, setShowRules] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [joinCodeInput, setJoinCodeInput] = useState(() => {
+    if (typeof window === 'undefined') return '';
     const params = new URLSearchParams(window.location.search);
     return params.get('room')?.toUpperCase() || '';
   });
@@ -148,11 +150,16 @@ function GameApp() {
   const [winner, setWinner] = useState<StoneColor | 'DRAW' | null>(null);
   const [winReason, setWinReason] = useState<string | undefined>();
   const [aiDifficulty, setAiDifficulty] = useState<AIDifficulty>('medium');
-  const [isAiThinking, setIsAiThinking] = useState(false);
+  const isAiThinking = mode === 'ai' && currentTurn === 'W' && !isGameOver;
 
   // Timer countdown
   const [turnTimeLeft, setTurnTimeLeft] = useState<number>(45);
-  const localTurnStartTimeRef = useRef<number>(0);
+  const [localTurnStartTime, setLocalTurnStartTime] = useState<number>(0);
+
+  // P2P and Notification Refs
+  const p2pRef = useRef<P2PGameSync | null>(null);
+  const hasAnnouncedStartRef = useRef<boolean>(false);
+  const prevMoveRef = useRef<number>(0);
 
   // Sound sync
   useEffect(() => {
@@ -168,9 +175,177 @@ function GameApp() {
 
   const handleRandomizeName = () => {
     const newName = getRandomProfile();
-    const newAv = AVATARS[Math.floor(Math.random() * AVATARS.length)];
+    const newAv = AVATARS[Math.floor(Math.random() * RANDOM_NAMES.length)];
     savePlayerProfile(newName, newAv);
   };
+
+  // Trigger game start banner once with 1.5s fade out
+  const triggerGameStartAnnouncement = useCallback(() => {
+    setShowGameStart(true);
+    setShowShareModal(false);
+    setIsMatchmaking(false);
+    setTimeout(() => {
+      setShowGameStart(false);
+    }, 1500);
+  }, []);
+
+  // Initialize P2P connection for a room
+  const setupP2P = useCallback(
+    (roomId: string, isHost: boolean) => {
+      if (p2pRef.current) {
+        p2pRef.current.destroy();
+      }
+
+      const p2p = new P2PGameSync({
+        onConnected: () => {
+          // Direct WebRTC channel opened
+        },
+        onMoveReceived: (r, c, playerColor) => {
+          setOnlineRoom((prev) => {
+            if (!prev || prev.isGameOver) return prev;
+            sounds.playStoneClack();
+            const moveRes = applyMove(prev.board, r, c, playerColor);
+            if (!moveRes) return prev;
+
+            if (moveRes.flipped.length > 0) {
+              sounds.playFlipStone(moveRes.flipped.length);
+            }
+            if (moveRes.nextColor === myOnlineRole && !moveRes.isGameOver) {
+              sounds.playTurnAlert();
+            }
+            if (moveRes.isGameOver) {
+              sounds.playVictory();
+            }
+
+            return {
+              ...prev,
+              board: moveRes.newBoard,
+              currentTurn: moveRes.nextColor,
+              blackCount: moveRes.blackCount,
+              whiteCount: moveRes.whiteCount,
+              isGameOver: moveRes.isGameOver,
+              winner: moveRes.winner,
+              winReason: moveRes.isGameOver
+                ? moveRes.winner === 'DRAW'
+                  ? 'Hai bên hòa cờ!'
+                  : `${playerColor === 'B' ? prev.playerBlack?.name : prev.playerWhite?.name} chiến thắng!`
+                : prev.winReason,
+              lastMove: { r, c, player: playerColor },
+              lastFlipped: moveRes.flipped,
+              turnStartTime: Date.now(),
+              moveHistory: [
+                ...prev.moveHistory,
+                {
+                  player: playerColor,
+                  r,
+                  c,
+                  flippedCount: moveRes.flipped.length,
+                  timestamp: Date.now(),
+                },
+              ],
+            };
+          });
+          setTurnTimeLeft(45);
+        },
+        onDisconnected: () => {
+          // Opponent closed or disconnected: award immediate victory
+          setOnlineRoom((prev) => {
+            if (!prev || prev.isGameOver || prev.status !== 'playing') return prev;
+            const oppColor = myOnlineRole === 'B' ? 'W' : 'B';
+            const oppName =
+              myOnlineRole === 'B'
+                ? prev.playerWhite?.name || 'Đối thủ'
+                : prev.playerBlack?.name || 'Đối thủ';
+            sounds.playVictory();
+            const myWinnerColor: StoneColor | null =
+              myOnlineRole === 'B' || myOnlineRole === 'W' ? myOnlineRole : null;
+            return {
+              ...prev,
+              status: 'ended',
+              isGameOver: true,
+              winner: myWinnerColor,
+              winReason: `${oppName} đã rời trận / mất kết nối! Bạn giành chiến thắng!`,
+            };
+          });
+        },
+        onSurrenderReceived: (surrenderingPlayerId) => {
+          setOnlineRoom((prev) => {
+            if (!prev || prev.isGameOver) return prev;
+            const isBlack = prev.playerBlack?.id === surrenderingPlayerId;
+            const oppName = isBlack ? prev.playerBlack?.name : prev.playerWhite?.name;
+            sounds.playVictory();
+            return {
+              ...prev,
+              status: 'ended',
+              isGameOver: true,
+              winner: isBlack ? 'W' : 'B',
+              winReason: `${oppName} đã xin nhận thua! Bạn giành chiến thắng!`,
+            };
+          });
+        },
+        onRematchRequested: (requesterId) => {
+          setOnlineRoom((prev) => {
+            if (!prev) return prev;
+            const isBlack = prev.playerBlack?.id === requesterId;
+            return {
+              ...prev,
+              playerBlack: prev.playerBlack
+                ? { ...prev.playerBlack, rematchRequested: isBlack ? true : prev.playerBlack.rematchRequested }
+                : null,
+              playerWhite: prev.playerWhite
+                ? { ...prev.playerWhite, rematchRequested: !isBlack ? true : prev.playerWhite.rematchRequested }
+                : null,
+            };
+          });
+        },
+        onRematchAccepted: () => {
+          setOnlineRoom((prev) => {
+            if (!prev) return prev;
+            const newBlack = prev.playerWhite;
+            const newWhite = prev.playerBlack;
+            if (newBlack) newBlack.rematchRequested = false;
+            if (newWhite) newWhite.rematchRequested = false;
+            const initialB = createInitialBoard(8);
+            const cnt = countStones(initialB);
+            return {
+              ...prev,
+              board: initialB,
+              currentTurn: 'B',
+              status: 'playing',
+              isGameOver: false,
+              winner: null,
+              winReason: undefined,
+              playerBlack: newBlack,
+              playerWhite: newWhite,
+              blackCount: cnt.black,
+              whiteCount: cnt.white,
+              lastMove: null,
+              lastFlipped: [],
+              turnStartTime: Date.now(),
+              moveHistory: [],
+            };
+          });
+          setMyOnlineRole((old) => (old === 'B' ? 'W' : 'B'));
+          setRematchSent(false);
+          hasAnnouncedStartRef.current = false;
+          triggerGameStartAnnouncement();
+        },
+        onChatReceived: (msg) => {
+          setOnlineRoom((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              chatMessages: [...prev.chatMessages, msg],
+            };
+          });
+        },
+      });
+
+      p2p.init(roomId, isHost, playerId, playerName.trim(), avatar);
+      p2pRef.current = p2p;
+    },
+    [playerId, playerName, avatar, myOnlineRole, triggerGameStartAnnouncement]
+  );
 
   // ----------------- ROOM CREATION & JOINING -----------------
 
@@ -193,6 +368,11 @@ function GameApp() {
             player: { id: playerId, name: playerName.trim(), avatar },
           }),
         });
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          setJoinError('Lỗi kết nối máy chủ');
+          return;
+        }
         const data = await res.json();
         if (!data.success || !data.room) {
           setJoinError(data.error || 'Không tìm thấy phòng');
@@ -203,6 +383,18 @@ function GameApp() {
         setMyOnlineRole(data.role);
         setMode('online_room');
         setIsMatchmaking(false);
+        prevMoveRef.current = data.room.moveHistory.length;
+
+        // Establish WebRTC P2P channel
+        setupP2P(data.room.id, false);
+
+        // If game is now playing, trigger start announcement
+        if (data.room.status === 'playing') {
+          hasAnnouncedStartRef.current = true;
+          triggerGameStartAnnouncement();
+        } else {
+          hasAnnouncedStartRef.current = false;
+        }
         sounds.playTurnAlert();
       } catch (err) {
         console.error(err);
@@ -211,7 +403,7 @@ function GameApp() {
         setIsLoading(false);
       }
     },
-    [joinCodeInput, playerId, playerName, avatar]
+    [joinCodeInput, playerId, playerName, avatar, setupP2P, triggerGameStartAnnouncement]
   );
 
   const createCustomRoom = async () => {
@@ -225,6 +417,8 @@ function GameApp() {
           player: { id: playerId, name: playerName.trim(), avatar },
         }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return;
       const data = await res.json();
       if (data.success && data.room) {
         setOnlineRoom(data.room);
@@ -232,6 +426,11 @@ function GameApp() {
         setMyOnlineRole(role);
         setMode('online_room');
         setShowShareModal(true);
+        hasAnnouncedStartRef.current = false;
+        prevMoveRef.current = 0;
+
+        // Host initializes P2P listener
+        setupP2P(data.room.id, true);
       }
     } catch (err) {
       console.error(err);
@@ -257,6 +456,8 @@ function GameApp() {
           avatar,
         }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return;
       const data = await res.json();
       if (data.status === 'matched' && data.roomId) {
         setIsMatchmaking(false);
@@ -281,7 +482,7 @@ function GameApp() {
     }
   };
 
-  // Poll matchmaking queue if searching (Fast 400ms polling for instant match)
+  // Poll matchmaking queue if searching
   useEffect(() => {
     if (!isMatchmaking) return;
 
@@ -296,6 +497,8 @@ function GameApp() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'poll', playerId }),
         });
+        const contentType = res.headers.get('content-type') || '';
+        if (!res.ok || !contentType.includes('application/json')) return;
         const data = await res.json();
         if (isSubscribed && data.status === 'matched' && data.roomId) {
           setIsMatchmaking(false);
@@ -321,7 +524,6 @@ function GameApp() {
 
   // ----------------- ONLINE ROOM POLLING (ZERO-DELAY SYNC) -----------------
 
-  const prevMoveRef = useRef<number>(0);
   const roomId = onlineRoom?.id;
   const isOnlineGameOver = onlineRoom?.isGameOver;
   const currentRoomTurn = onlineRoom?.currentTurn;
@@ -338,11 +540,13 @@ function GameApp() {
 
       try {
         const res = await fetch(`/api/rooms/${roomId}?playerId=${playerId}`);
+        const contentType = res.headers.get('content-type') || '';
+        if (!res.ok || !contentType.includes('application/json')) return;
         const data = await res.json();
         if (isSubscribed && data.success && data.room) {
           const room: GameRoom = data.room;
 
-          // Sound triggers on new opponent move
+          // Sound triggers on new opponent move from server
           const moveLen = room.moveHistory.length;
           if (moveLen > prevMoveRef.current) {
             const lastM = room.moveHistory[moveLen - 1];
@@ -367,19 +571,15 @@ function GameApp() {
           const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
           setTurnTimeLeft(remaining);
 
-          // Auto-close matchmaking/waiting and show game start
-          if (room.status === 'playing' && onlineRoom?.status !== 'playing') {
-            setShowGameStart(true);
-            setTimeout(() => setShowGameStart(false), 1500);
-            if (isMatchmaking) setIsMatchmaking(false);
-            setShowShareModal(false);
+          // Auto-close matchmaking/waiting and show "BẮT ĐẦU" notification
+          if (room.status === 'playing' && !hasAnnouncedStartRef.current) {
+            hasAnnouncedStartRef.current = true;
+            triggerGameStartAnnouncement();
           }
-          
-          // Handle disconnection immediately
-          if (room.status === 'playing' && 
-              ((onlineRoom?.playerBlack?.connected && !room.playerBlack?.connected) ||
-               (onlineRoom?.playerWhite?.connected && !room.playerWhite?.connected))) {
-            // Server should have triggered surrender, we just update UI
+
+          if (room.status === 'playing') {
+            setShowShareModal(false);
+            setIsMatchmaking(false);
           }
 
           setOnlineRoom(room);
@@ -389,10 +589,11 @@ function GameApp() {
       }
 
       if (isSubscribed) {
-        // Fast 300ms polling when waiting for opponent move!
-        // 800ms when waiting for user to move or game is ended
-        const isWaitingForOpponent = roomStatus === 'playing' && currentRoomTurn !== myOnlineRole && !isOnlineGameOver;
-        const intervalMs = isWaitingForOpponent ? 300 : 800;
+        // Fast 350ms polling when waiting for opponent move
+        // 750ms when waiting for user to move or game is ended
+        const isWaitingForOpponent =
+          roomStatus === 'playing' && currentRoomTurn !== myOnlineRole && !isOnlineGameOver;
+        const intervalMs = isWaitingForOpponent ? 350 : 750;
         pollTimer = setTimeout(fetchRoomState, intervalMs);
       }
     };
@@ -403,7 +604,33 @@ function GameApp() {
       isSubscribed = false;
       clearTimeout(pollTimer);
     };
-  }, [mode, roomId, playerId, myOnlineRole, isOnlineGameOver, currentRoomTurn, roomStatus, isMatchmaking, onlineRoom?.status]);
+  }, [
+    mode,
+    roomId,
+    playerId,
+    myOnlineRole,
+    isOnlineGameOver,
+    currentRoomTurn,
+    roomStatus,
+    triggerGameStartAnnouncement,
+  ]);
+
+  // Handle window/tab close: immediate surrender/forfeiture
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (mode === 'online_room' && onlineRoom && onlineRoom.status === 'playing' && !onlineRoom.isGameOver) {
+        p2pRef.current?.send({ type: 'LEAVE', playerId });
+        const payload = JSON.stringify({ action: 'leave', playerId });
+        const blob = new Blob([payload], { type: 'application/json' });
+        navigator.sendBeacon(`/api/rooms/${onlineRoom.id}`, blob);
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [mode, onlineRoom, playerId]);
 
   // ----------------- ONLINE MOVE ACTIONS (OPTIMISTIC 0MS RESPONSE) -----------------
 
@@ -437,14 +664,40 @@ function GameApp() {
         currentTurn: opponentRole,
         blackCount: counts.black,
         whiteCount: counts.white,
+        isGameOver: moveResult.isGameOver,
+        winner: moveResult.winner,
         lastMove: { r, c, player: myRole },
         lastFlipped: flipped,
         turnStartTime: Date.now(),
+        moveHistory: [
+          ...prev.moveHistory,
+          {
+            player: myRole,
+            r,
+            c,
+            flippedCount: flipped.length,
+            timestamp: Date.now(),
+          },
+        ],
       };
     });
     setTurnTimeLeft(45);
+    prevMoveRef.current = onlineRoom.moveHistory.length + 1;
 
-    // 3. Dispatch move to server
+    if (moveResult.isGameOver) {
+      sounds.playVictory();
+    }
+
+    // 3. Fast P2P delivery to opponent
+    p2pRef.current?.send({
+      type: 'MOVE',
+      r,
+      c,
+      playerId,
+      playerColor: myRole,
+    });
+
+    // 4. Server API synchronization
     try {
       const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
         method: 'POST',
@@ -456,18 +709,18 @@ function GameApp() {
           c,
         }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return;
       const data = await res.json();
       if (data.success && data.room) {
         setOnlineRoom(data.room);
-      } else {
-        // Rollback on rejection
+      } else if (!p2pRef.current) {
+        // Rollback only if pure server mode and server explicitly rejected
         setOnlineRoom(prevRoomSnapshot);
         sounds.playInvalid();
       }
     } catch (err) {
       console.error('Online move error:', err);
-      setOnlineRoom(prevRoomSnapshot);
-      sounds.playInvalid();
     }
   };
 
@@ -475,6 +728,8 @@ function GameApp() {
     if (!onlineRoom || onlineRoom.isGameOver) return;
     const confirmSurrender = window.confirm('Bạn có chắc chắn muốn nhận thua không?');
     if (!confirmSurrender) return;
+
+    p2pRef.current?.send({ type: 'SURRENDER', playerId });
 
     try {
       const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
@@ -485,6 +740,8 @@ function GameApp() {
           playerId,
         }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return;
       const data = await res.json();
       if (data.success && data.room) {
         setOnlineRoom(data.room);
@@ -498,6 +755,8 @@ function GameApp() {
     if (!onlineRoom) return;
     setRematchSent(true);
 
+    p2pRef.current?.send({ type: 'REMATCH_REQUEST', playerId });
+
     try {
       const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
         method: 'POST',
@@ -505,6 +764,52 @@ function GameApp() {
         body: JSON.stringify({
           action: 'rematch',
           playerId,
+        }),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return;
+      const data = await res.json();
+      if (data.success && data.room) {
+        setOnlineRoom(data.room);
+        if (data.room.status === 'playing' && !data.room.isGameOver) {
+          // Rematch accepted
+          p2pRef.current?.send({ type: 'REMATCH_ACCEPT' });
+          setMyOnlineRole((old) => (old === 'B' ? 'W' : 'B'));
+          setRematchSent(false);
+          hasAnnouncedStartRef.current = false;
+          triggerGameStartAnnouncement();
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleOnlineChat = async (text: string) => {
+    if (!onlineRoom) return;
+
+    const chatMsg = {
+      id: `chat-${Date.now()}`,
+      senderName: playerName,
+      senderId: playerId,
+      color: myOnlineRole === 'spectator' ? undefined : myOnlineRole || undefined,
+      text,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    p2pRef.current?.send({
+      type: 'CHAT',
+      ...chatMsg,
+    });
+
+    try {
+      const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'chat',
+          playerId,
+          text,
         }),
       });
       const data = await res.json();
@@ -516,26 +821,9 @@ function GameApp() {
     }
   };
 
-  const handleOnlineChat = async (text: string) => {
-    if (!onlineRoom) return;
-    try {
-      await fetch(`/api/rooms/${onlineRoom.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'chat',
-          playerId,
-          text,
-        }),
-      });
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
   // ----------------- LOCAL & AI GAME LOGIC -----------------
 
-  const startLocalGame = () => {
+  const startLocalGame = useCallback(() => {
     setBoard(createInitialBoard(8));
     setCurrentTurn('B');
     setLastMove(null);
@@ -544,87 +832,81 @@ function GameApp() {
     setWinner(null);
     setWinReason(undefined);
     setMode('local');
-    localTurnStartTimeRef.current = Date.now();
+    setLocalTurnStartTime(Date.now());
     setTurnTimeLeft(45);
-    sounds.playTurnAlert();
-  };
+  }, []);
 
-  const startAiGame = (difficulty: AIDifficulty = 'medium') => {
+  const startAiGame = useCallback((difficulty: AIDifficulty) => {
     setAiDifficulty(difficulty);
     setBoard(createInitialBoard(8));
-    setCurrentTurn('B'); // Player is Black, AI is White
+    setCurrentTurn('B');
     setLastMove(null);
     setLastFlipped([]);
     setIsGameOver(false);
     setWinner(null);
     setWinReason(undefined);
-    setIsAiThinking(false);
     setMode('ai');
-    localTurnStartTimeRef.current = Date.now();
+    setLocalTurnStartTime(Date.now());
     setTurnTimeLeft(45);
-    sounds.playTurnAlert();
+  }, []);
+
+  const handleLocalOrAiMove = (r: number, c: number) => {
+    if (isGameOver) return;
+    if (board[r][c] !== null) return;
+    if (mode === 'ai' && (currentTurn !== 'B' || isAiThinking)) return;
+
+    sounds.playStoneClack();
+    const result = applyMove(board, r, c, currentTurn);
+    if (!result) {
+      sounds.playInvalid();
+      return;
+    }
+
+    if (result.flipped.length > 0) {
+      sounds.playFlipStone(result.flipped.length);
+    }
+
+    setBoard(result.newBoard);
+    setCurrentTurn(result.nextColor);
+    setLastMove({ r, c, player: currentTurn });
+    setLastFlipped(result.flipped);
+    setLocalTurnStartTime(Date.now());
+    setTurnTimeLeft(45);
+
+    if (result.isGameOver) {
+      setIsGameOver(true);
+      setWinner(result.winner);
+      const { black, white } = countStones(result.newBoard);
+      setWinReason(
+        result.winner === 'DRAW'
+          ? 'Hai bên hòa cờ!'
+          : result.winner === 'B'
+          ? `Người chơi 1 (Quân Đen) thắng với ${black} quân!`
+          : `Người chơi 2 (Quân Trắng) thắng với ${white} quân!`
+      );
+      sounds.playVictory();
+    }
   };
 
-  const handleLocalOrAiMove = useCallback(
-    (r: number, c: number) => {
-      if (isGameOver || isAiThinking) return;
-
-      const result = applyMove(board, r, c, currentTurn);
-      if (!result) {
-        sounds.playInvalid();
-        return;
-      }
-
-      sounds.playStoneClack();
-      if (result.flipped.length > 0) {
-        sounds.playFlipStone(result.flipped.length);
-      }
-
-      localTurnStartTimeRef.current = Date.now();
-      setTurnTimeLeft(45);
-      setBoard(result.newBoard);
-      setLastMove({ r, c, player: currentTurn });
-      setLastFlipped(result.flipped);
-      setCurrentTurn(result.nextColor);
-
-      if (result.isGameOver) {
-        setIsGameOver(true);
-        setWinner(result.winner);
-        const { black, white } = countStones(result.newBoard);
-        setWinReason(
-          result.winner === 'DRAW'
-            ? 'Hai bên bằng điểm nhau!'
-            : result.winner === 'B'
-            ? `Quân Đen thắng với ${black} quân!`
-            : `Quân Trắng thắng với ${white} quân!`
-        );
-        sounds.playVictory();
-      } else if (mode === 'ai' && result.nextColor === 'W') {
-        setIsAiThinking(true);
-      }
-    },
-    [board, currentTurn, isGameOver, isAiThinking, mode]
-  );
-
-  // Trigger AI move when it's AI's turn (White)
+  // AI Turn Handling
   useEffect(() => {
-    if (mode !== 'ai' || isGameOver || currentTurn !== 'W') return;
+    if (mode !== 'ai' || currentTurn !== 'W' || isGameOver) return;
 
     const timer = setTimeout(() => {
-      const aiPos = getAIMove(board, 'W', aiDifficulty);
-      if (aiPos) {
-        const res = applyMove(board, aiPos.r, aiPos.c, 'W');
+      const aiMove = getAIMove(board, 'W', aiDifficulty);
+      if (aiMove) {
+        sounds.playStoneClack();
+        const res = applyMove(board, aiMove.r, aiMove.c, 'W');
         if (res) {
-          sounds.playStoneClack();
           if (res.flipped.length > 0) {
             sounds.playFlipStone(res.flipped.length);
           }
-          localTurnStartTimeRef.current = Date.now();
-          setTurnTimeLeft(45);
           setBoard(res.newBoard);
-          setLastMove({ r: aiPos.r, c: aiPos.c, player: 'W' });
-          setLastFlipped(res.flipped);
           setCurrentTurn(res.nextColor);
+          setLastMove({ r: aiMove.r, c: aiMove.c, player: 'W' });
+          setLastFlipped(res.flipped);
+          setLocalTurnStartTime(Date.now());
+          setTurnTimeLeft(45);
 
           if (res.isGameOver) {
             setIsGameOver(true);
@@ -641,7 +923,6 @@ function GameApp() {
           }
         }
       }
-      setIsAiThinking(false);
     }, 600);
 
     return () => clearTimeout(timer);
@@ -674,10 +955,8 @@ function GameApp() {
     if (isGameOver) return;
 
     const interval = setInterval(() => {
-      if (!localTurnStartTimeRef.current) {
-        localTurnStartTimeRef.current = Date.now();
-      }
-      const elapsed = Math.floor((Date.now() - localTurnStartTimeRef.current) / 1000);
+      const startTime = localTurnStartTime || Date.now();
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
       const remaining = Math.max(0, 45 - elapsed);
       setTurnTimeLeft(remaining);
 
@@ -709,10 +988,11 @@ function GameApp() {
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [mode, currentTurn, isGameOver]);
+  }, [mode, currentTurn, isGameOver, localTurnStartTime]);
 
   const handleExitToLobby = async () => {
     if (mode === 'online_room' && onlineRoom) {
+      p2pRef.current?.send({ type: 'LEAVE', playerId });
       try {
         await fetch(`/api/rooms/${onlineRoom.id}`, {
           method: 'POST',
@@ -726,11 +1006,18 @@ function GameApp() {
         console.error('Error leaving room:', err);
       }
     }
+
+    if (p2pRef.current) {
+      p2pRef.current.destroy();
+      p2pRef.current = null;
+    }
+
     setMode('lobby');
     setOnlineRoom(null);
     setMyOnlineRole(null);
     setRematchSent(false);
     setIsMatchmaking(false);
+    hasAnnouncedStartRef.current = false;
   };
 
   // Compute counts & valid moves based on active mode
@@ -758,10 +1045,10 @@ function GameApp() {
 
   return (
     <main className="min-h-screen bg-[#F5F1E8] text-[#1F1C19] flex flex-col items-center justify-between p-3 sm:p-6 selection:bg-[#A83226] selection:text-white">
-      {/* -------------------- LOBBY VIEW (Paper / Xuan paper aesthetic, NO gradients) -------------------- */}
+      {/* -------------------- LOBBY VIEW -------------------- */}
       {mode === 'lobby' ? (
         <div className="w-full max-w-xl mx-auto flex flex-col items-center justify-center my-auto py-4">
-          {/* Editorial Header (Natural typography, no sparkles or tech pills) */}
+          {/* Header */}
           <div className="text-center mb-6">
             <div className="text-[11px] font-bold text-[#7A5432] tracking-widest uppercase mb-1">
               Kỳ Đạo Đối Kháng
@@ -774,7 +1061,7 @@ function GameApp() {
             </p>
           </div>
 
-          {/* Player Profile Card (Washi paper tile with tactile borders) */}
+          {/* Player Profile Card */}
           <div className="w-full bg-[#FAF6F0] border border-[#DDD3C2] rounded-2xl p-4 sm:p-5 shadow-xs mb-5">
             <div className="flex items-center justify-between mb-3">
               <span className="text-[11px] font-bold uppercase tracking-wider text-[#6B635A]">
@@ -790,14 +1077,12 @@ function GameApp() {
             </div>
 
             <div className="flex items-center gap-3">
-              {/* Avatar display box */}
               <div className="relative shrink-0">
                 <div className="w-14 h-14 rounded-xl bg-[#F0EAE0] border-2 border-[#1F1C19] flex items-center justify-center text-3xl shadow-xs select-none">
                   {avatar}
                 </div>
               </div>
 
-              {/* Name input */}
               <div className="flex-1">
                 <input
                   type="text"
@@ -810,7 +1095,7 @@ function GameApp() {
               </div>
             </div>
 
-            {/* 16-Avatar Grid (Clean 8x2 grid on paper) */}
+            {/* 16-Avatar Grid */}
             <div className="mt-3 pt-3 border-t border-[#DDD3C2]">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-[11px] font-semibold text-[#6B635A]">
@@ -828,10 +1113,9 @@ function GameApp() {
                     onClick={() => savePlayerProfile(playerName, av)}
                     className={`h-9 sm:h-10 rounded-lg flex items-center justify-center text-xl transition-all cursor-pointer ${
                       avatar === av
-                        ? 'bg-[#24201D] text-white border-2 border-[#161412] shadow-xs scale-105'
-                        : 'bg-[#F0EAE0] hover:bg-[#E5DECF] border border-[#DDD3C2] text-[#1F1C19]'
+                        ? 'bg-[#1F1C19] scale-105 shadow-xs'
+                        : 'bg-[#F0EAE0] hover:bg-[#E5DEC8] border border-[#DDD3C2]'
                     }`}
-                    title={`Chọn biểu tượng ${av}`}
                   >
                     {av}
                   </button>
@@ -840,52 +1124,79 @@ function GameApp() {
             </div>
           </div>
 
-          {/* Action Cards (Solid, grounded buttons - NO gradients!) */}
-          <div className="w-full flex flex-col gap-2.5">
-            {/* 1. Quick Match Online: Elegant Sumi-e ink black button (calm, non-glaring, paper-harmonious) */}
+          {/* URL Room Invitation Notice */}
+          {joinCodeInput && (
+            <div className="w-full bg-[#FCFAF2] border-2 border-[#7A5432] rounded-2xl p-4 mb-5 shadow-xs flex items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-1.5 text-xs font-bold text-[#7A5432]">
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Lời mời tham gia phòng thi đấu</span>
+                </div>
+                <div className="text-sm font-black text-[#1F1C19] mt-0.5">
+                  Mã phòng: <span className="font-mono text-base">{joinCodeInput}</span>
+                </div>
+              </div>
+              <button
+                onClick={() => joinOnlineRoom(joinCodeInput)}
+                disabled={isLoading}
+                className="px-4 py-2 bg-[#24201D] hover:bg-[#36312C] text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center gap-1.5 shrink-0"
+              >
+                {isLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ArrowRight className="w-3.5 h-3.5" />}
+                <span>Tham gia ngay</span>
+              </button>
+            </div>
+          )}
+
+          {/* Game Modes Section */}
+          <div className="w-full flex flex-col gap-3">
+            {/* 1. Fast Matchmaking */}
             <button
               onClick={startMatchmaking}
-              className="w-full p-4 rounded-xl bg-[#24201D] hover:bg-[#36312C] active:bg-[#1A1715] text-[#FAF7F0] font-bold text-base transition-colors flex items-center justify-between border-2 border-[#161412] shadow-xs group"
+              className="w-full bg-[#24201D] hover:bg-[#36312C] text-[#FAF7F0] border border-[#161412] rounded-2xl p-4 sm:p-5 flex items-center justify-between shadow-xs transition-all cursor-pointer active:scale-[0.99]"
             >
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-[#181614] border border-[#3D3730] flex items-center justify-center text-[#FAF7F0]">
-                  <Swords className="w-5 h-5" />
+              <div className="flex items-center gap-3.5">
+                <div className="w-12 h-12 rounded-xl bg-[#36312C] flex items-center justify-center text-2xl shrink-0">
+                  <Swords className="w-6 h-6 text-[#E5DEC8]" />
                 </div>
                 <div className="text-left">
-                  <div className="text-base font-black leading-tight tracking-wide text-[#FAF7F0]">
-                    GHÉP TRẬN ONLINE
+                  <div className="font-black text-base sm:text-lg">
+                    Tìm trận online ngay
                   </div>
-                  <div className="text-xs text-[#A8A094] font-medium">
-                    Tìm đối thủ trực tuyến theo thời gian thực
+                  <div className="text-xs text-[#B5ABA0]">
+                    Ghép đôi tự động với kỳ thủ ngẫu nhiên trên mạng
                   </div>
                 </div>
               </div>
-              <ArrowRight className="w-5 h-5 text-[#C8BFB2] transition-transform group-hover:translate-x-1" />
+              <ArrowRight className="w-5 h-5 text-[#E5DEC8]" />
             </button>
 
-            {/* 2. Custom Room (Create or Join) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              <button
-                onClick={createCustomRoom}
-                className="p-3.5 bg-[#FAF6F0] hover:bg-[#F2ECE0] border border-[#DDD3C2] hover:border-[#1F1C19] rounded-xl transition-colors flex items-center gap-3 text-left shadow-xs group"
-              >
-                <div className="p-2 rounded-lg bg-[#EFE8DC] text-[#1F1C19] border border-[#D5CCBC]">
-                  <PlusCircle className="w-5 h-5" />
-                </div>
-                <div>
-                  <div className="font-bold text-xs sm:text-sm text-[#1F1C19]">
-                    Tạo phòng thi đấu
-                  </div>
-                  <div className="text-[11px] text-[#6B635A]">Mời bạn bè qua mã/link</div>
-                </div>
-              </button>
+            {/* 2. Custom Room */}
+            <div className="w-full bg-[#FAF6F0] border border-[#DDD3C2] rounded-2xl p-4 sm:p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <Users className="w-4 h-4 text-[#7A5432]" />
+                <span className="text-xs font-bold uppercase tracking-wider text-[#6B635A]">
+                  Phòng thi đấu riêng với bạn bè
+                </span>
+              </div>
 
-              <div className="p-3 bg-[#FAF6F0] border border-[#DDD3C2] rounded-xl flex flex-col justify-between shadow-xs">
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <LogIn className="w-3.5 h-3.5 text-[#5C544B]" />
-                  <span className="font-bold text-xs text-[#1F1C19]">Vào bằng mã phòng:</span>
-                </div>
-                <div className="flex items-center gap-1.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <button
+                  onClick={createCustomRoom}
+                  disabled={isLoading}
+                  className="w-full bg-[#F2ECE0] hover:bg-[#EAE2D2] border border-[#D5CCBC] rounded-xl p-3 flex items-center gap-3 transition-colors text-left cursor-pointer"
+                >
+                  <PlusCircle className="w-5 h-5 text-[#7A5432] shrink-0" />
+                  <div>
+                    <div className="font-bold text-xs sm:text-sm text-[#1F1C19]">
+                      Tạo phòng mới
+                    </div>
+                    <div className="text-[11px] text-[#6B635A]">
+                      Nhận mã phòng chia sẻ cho bạn bè
+                    </div>
+                  </div>
+                </button>
+
+                <div className="flex items-center gap-2">
                   <input
                     type="text"
                     value={joinCodeInput}
@@ -893,70 +1204,72 @@ function GameApp() {
                       setJoinCodeInput(e.target.value.toUpperCase());
                       setJoinError('');
                     }}
-                    placeholder="MÃ PHÒNG"
+                    placeholder="Nhập mã phòng..."
                     maxLength={6}
-                    className="w-full bg-[#F4EFE6] text-[#1F1C19] font-mono font-bold text-xs px-2.5 py-1.5 rounded-lg border border-[#D5CCBC] uppercase tracking-wider focus:outline-none focus:border-[#1F1C19]"
+                    className="w-full bg-[#F4EFE6] text-[#1F1C19] font-mono font-bold text-xs sm:text-sm px-3 py-2.5 rounded-xl border border-[#D5CCBC] focus:outline-none focus:border-[#1F1C19] uppercase"
                   />
                   <button
                     onClick={() => joinOnlineRoom()}
-                    className="px-3 py-1.5 bg-[#1F1C19] hover:bg-[#38332E] text-white text-xs font-bold rounded-lg transition-colors border border-[#141210]"
+                    disabled={isLoading || !joinCodeInput.trim()}
+                    className="px-3.5 py-2.5 bg-[#24201D] hover:bg-[#36312C] disabled:bg-[#8C8478] text-[#FAF7F0] font-bold text-xs rounded-xl transition-colors shrink-0 flex items-center gap-1 cursor-pointer"
                   >
-                    Vào
+                    <LogIn className="w-4 h-4" />
+                    <span>Vào</span>
                   </button>
                 </div>
-                {joinError && <div className="text-[10px] text-[#7A5432] mt-1 font-semibold">{joinError}</div>}
               </div>
+
+              {joinError && (
+                <div className="text-xs text-[#A83226] font-bold mt-2.5">
+                  {joinError}
+                </div>
+              )}
             </div>
 
-            {/* 3. AI & Local Modes */}
+            {/* 3. Offline Modes */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               {/* Play with AI */}
-              <div className="p-3 bg-[#FAF6F0] border border-[#DDD3C2] rounded-xl shadow-xs">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <Bot className="w-4 h-4 text-[#5C544B]" />
-                  <span className="font-bold text-xs text-[#1F1C19]">Luyện tập với AI</span>
+              <div className="bg-[#FAF6F0] border border-[#DDD3C2] rounded-2xl p-4 flex flex-col justify-between">
+                <div className="flex items-center gap-2 mb-2">
+                  <Bot className="w-4 h-4 text-[#7A5432]" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-[#6B635A]">
+                    Luyện tập với AI
+                  </span>
                 </div>
-                <div className="grid grid-cols-3 gap-1.5">
-                  <button
-                    onClick={() => startAiGame('easy')}
-                    className="py-1.5 bg-[#EFE8DC] hover:bg-[#E5DECF] text-[#2C2723] rounded-lg text-xs font-semibold transition-colors border border-[#D5CCBC]"
-                  >
-                    Dễ
-                  </button>
-                  <button
-                    onClick={() => startAiGame('medium')}
-                    className="py-1.5 bg-[#EFE8DC] hover:bg-[#E5DECF] text-[#2C2723] rounded-lg text-xs font-semibold transition-colors border border-[#D5CCBC]"
-                  >
-                    Thường
-                  </button>
-                  <button
-                    onClick={() => startAiGame('hard')}
-                    className="py-1.5 bg-[#1F1C19] hover:bg-[#38332E] text-white rounded-lg text-xs font-bold transition-colors border border-[#141210]"
-                  >
-                    Cao Thủ
-                  </button>
+                <div className="grid grid-cols-3 gap-1.5 mt-2">
+                  {(['easy', 'medium', 'hard'] as AIDifficulty[]).map((diff) => (
+                    <button
+                      key={diff}
+                      onClick={() => startAiGame(diff)}
+                      className="py-1.5 px-2 bg-[#F2ECE0] hover:bg-[#24201D] hover:text-white border border-[#D5CCBC] rounded-lg text-xs font-bold transition-colors capitalize text-center cursor-pointer"
+                    >
+                      {diff === 'easy' ? 'Dễ' : diff === 'medium' ? 'Thường' : 'Cao Thủ'}
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              {/* Pass and Play Local */}
+              {/* Local 2 Players */}
               <button
                 onClick={startLocalGame}
-                className="p-3.5 bg-[#FAF6F0] hover:bg-[#F2ECE0] border border-[#DDD3C2] hover:border-[#1F1C19] rounded-xl transition-colors flex items-center gap-3 text-left shadow-xs group"
+                className="bg-[#FAF6F0] hover:bg-[#F2ECE0] border border-[#DDD3C2] rounded-2xl p-4 flex items-center gap-3 transition-colors text-left cursor-pointer"
               >
-                <div className="p-2 rounded-lg bg-[#EFE8DC] text-[#1F1C19] border border-[#D5CCBC]">
-                  <Users className="w-5 h-5" />
+                <div className="w-10 h-10 rounded-xl bg-[#F0EAE0] border border-[#D5CCBC] flex items-center justify-center text-xl shrink-0">
+                  👥
                 </div>
                 <div>
                   <div className="font-bold text-xs sm:text-sm text-[#1F1C19]">
                     Chơi 2 người trên máy
                   </div>
-                  <div className="text-[11px] text-[#6B635A]">Đấu cờ cùng bạn trên cùng thiết bị</div>
+                  <div className="text-[11px] text-[#6B635A]">
+                    Đấu cờ cùng bạn trên cùng thiết bị
+                  </div>
                 </div>
               </button>
             </div>
           </div>
 
-          {/* Footer Controls: Rules & Audio */}
+          {/* Footer Controls */}
           <div className="flex items-center justify-between w-full mt-6 px-1 text-xs text-[#6B635A]">
             <button
               onClick={() => setShowRules(true)}
@@ -985,7 +1298,7 @@ function GameApp() {
           </div>
         </div>
       ) : (
-        /* -------------------- IN-GAME VIEW (Paper Desk Setting) -------------------- */
+        /* -------------------- IN-GAME VIEW -------------------- */
         <div className="w-full max-w-2xl mx-auto flex flex-col items-center py-1 sm:py-2">
           {/* Header Bar */}
           <GameHeader
@@ -1062,7 +1375,7 @@ function GameApp() {
             </div>
           )}
 
-          {/* Status Bar (Fixed height to prevent layout jump) */}
+          {/* Status Bar */}
           <div className="h-6 w-full flex items-center justify-center mb-1 text-xs">
             {mode === 'ai' && isAiThinking ? (
               <div className="text-[#24201D] flex items-center gap-1.5 font-bold">
@@ -1107,7 +1420,7 @@ function GameApp() {
             }}
           />
 
-          {/* In-game Chat (Online Room Mode) */}
+          {/* In-game Chat */}
           {mode === 'online_room' && onlineRoom && (
             <InGameChat
               messages={onlineRoom.chatMessages}
@@ -1120,7 +1433,7 @@ function GameApp() {
 
       {/* -------------------- MODALS -------------------- */}
 
-      {/* 1. Matchmaking Radar Modal */}
+      {/* 1. Matchmaking Modal */}
       <MatchmakingModal
         isOpen={isMatchmaking}
         playerName={playerName}
@@ -1144,16 +1457,16 @@ function GameApp() {
       {/* 3. Rules Modal */}
       <RulesModal isOpen={showRules} onClose={() => setShowRules(false)} />
 
-      {/* Game Start Notification */}
+      {/* 4. Game Start Notification (Auto-fade out in 1.5s) */}
       {showGameStart && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center pointer-events-none">
-          <div className="bg-green-600 text-white px-8 py-4 rounded-full text-2xl font-bold animate-start-fade-out shadow-lg">
+          <div className="bg-[#2E6B34] text-white px-8 py-3.5 rounded-full text-2xl font-black animate-start-fade-out shadow-2xl tracking-widest border-2 border-white/30">
             BẮT ĐẦU
           </div>
         </div>
       )}
 
-      {/* 4. Game Over Modal */}
+      {/* 5. Game Over Modal */}
       <GameOverModal
         isOpen={
           mode === 'online_room'
@@ -1204,10 +1517,15 @@ function GameApp() {
         onExit={handleExitToLobby}
       />
 
-      {/* Loading Overlay */}
+      {/* 6. Loading Overlay with message */}
       {isLoading && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-sm">
-          <Loader2 className="w-10 h-10 animate-spin text-white" />
+        <div className="fixed inset-0 z-[80] flex flex-col items-center justify-center bg-black/40 backdrop-blur-xs gap-3">
+          <div className="w-12 h-12 rounded-xl bg-[#FAF6EF] flex items-center justify-center shadow-lg border border-[#D5CCBC]">
+            <Loader2 className="w-6 h-6 animate-spin text-[#7A5432]" />
+          </div>
+          <div className="text-white text-xs font-bold tracking-wider bg-black/50 px-3 py-1 rounded-full">
+            Đang xử lý kết nối phòng...
+          </div>
         </div>
       )}
     </main>
