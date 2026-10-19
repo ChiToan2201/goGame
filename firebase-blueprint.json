@@ -1,0 +1,42 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "Game room for two-player online match",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Room ID / code"
+        },
+        "status": {
+          "type": "string",
+          "description": "Room status: waiting, playing, or ended"
+        },
+        "currentTurn": {
+          "type": "string",
+          "description": "Current turn: B or W"
+        },
+        "isGameOver": {
+          "type": "boolean",
+          "description": "Whether the match is over"
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Room creation timestamp"
+        },
+        "lastActive": {
+          "type": "number",
+          "description": "Last active timestamp"
+        }
+      },
+      "required": ["id", "status"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": "Room",
+      "description": "Stores online game rooms and live board states"
+    }
+  }
+}

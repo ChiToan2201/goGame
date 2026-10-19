@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { BoardState, StoneColor, Position, getFlippedStones } from '@/lib/game-engine';
+import { BoardState, StoneColor, Position, getFlippedStones, sounds } from '@/lib/game-engine';
 
 interface GobanBoardProps {
   board: BoardState;
@@ -54,10 +54,15 @@ export const GobanBoard: React.FC<GobanBoardProps> = ({
       : [];
 
   const handleCellClick = (r: number, c: number) => {
-    if (disabled || !isMyTurn) return;
+    if (disabled || !isMyTurn) {
+      sounds.playInvalid();
+      return;
+    }
     if (board[r][c] === null) {
       onMakeMove(r, c);
       setHoveredCell(null);
+    } else {
+      sounds.playInvalid();
     }
   };
 

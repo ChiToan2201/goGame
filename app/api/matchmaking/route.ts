@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'join') {
-      const result = multiplayerStore.addToMatchmaking({
+      const result = await multiplayerStore.addToMatchmakingAsync({
         id: playerId,
         name: playerName || 'Kỳ Thủ Vô Danh',
         avatar: avatar || '🥋',
@@ -20,12 +20,12 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'poll') {
-      const result = multiplayerStore.checkMatchmaking(playerId);
+      const result = await multiplayerStore.checkMatchmakingAsync(playerId);
       return NextResponse.json(result);
     }
 
     if (action === 'leave') {
-      multiplayerStore.removeFromMatchmaking(playerId);
+      await multiplayerStore.removeFromMatchmakingAsync(playerId);
       return NextResponse.json({ status: 'left' });
     }
 

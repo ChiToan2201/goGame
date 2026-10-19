@@ -30,6 +30,8 @@ import {
 } from '@/lib/game-engine';
 import { GameRoom } from '@/lib/multiplayer-store';
 import { P2PGameSync } from '@/lib/p2p-sync';
+import { db } from '@/lib/firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { GobanBoard } from '@/components/GobanBoard';
 import { GameHeader } from '@/components/GameHeader';
 import { MatchmakingModal } from '@/components/MatchmakingModal';
@@ -160,6 +162,7 @@ function GameApp() {
   const p2pRef = useRef<P2PGameSync | null>(null);
   const hasAnnouncedStartRef = useRef<boolean>(false);
   const prevMoveRef = useRef<number>(0);
+  const hasAutoJoinedRef = useRef<boolean>(false);
 
   // Sound sync
   useEffect(() => {
@@ -406,6 +409,17 @@ function GameApp() {
     [joinCodeInput, playerId, playerName, avatar, setupP2P, triggerGameStartAnnouncement]
   );
 
+  // Auto-join room directly when opening via shared link (?room=CODE)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const roomFromUrl = params.get('room')?.trim().toUpperCase();
+    if (roomFromUrl && mode === 'lobby' && !hasAutoJoinedRef.current) {
+      hasAutoJoinedRef.current = true;
+      joinOnlineRoom(roomFromUrl);
+    }
+  }, [mode, joinOnlineRoom]);
+
   const createCustomRoom = async () => {
     setIsLoading(true);
     try {
@@ -522,87 +536,114 @@ function GameApp() {
     };
   }, [isMatchmaking, playerId, joinOnlineRoom]);
 
-  // ----------------- ONLINE ROOM POLLING (ZERO-DELAY SYNC) -----------------
+  // ----------------- ONLINE ROOM REAL-TIME SYNC (FIRESTORE WEBSOCKET) -----------------
 
   const roomId = onlineRoom?.id;
   const isOnlineGameOver = onlineRoom?.isGameOver;
-  const currentRoomTurn = onlineRoom?.currentTurn;
-  const roomStatus = onlineRoom?.status;
 
   useEffect(() => {
     if (mode !== 'online_room' || !roomId) return;
 
     let isSubscribed = true;
-    let pollTimer: NodeJS.Timeout;
 
-    const fetchRoomState = async () => {
-      if (!isSubscribed) return;
+    // Real-time Firestore snapshot listener: sub-50ms sync across devices & Vercel
+    const unsubscribe = onSnapshot(
+      doc(db, 'rooms', roomId),
+      (snap) => {
+        if (!isSubscribed || !snap.exists()) return;
+        const data = snap.data();
+        let parsedBoard: BoardState;
+        try {
+          parsedBoard = data.boardStr ? JSON.parse(data.boardStr) : (data.board || createInitialBoard(8));
+        } catch {
+          parsedBoard = createInitialBoard(8);
+        }
 
-      try {
-        const res = await fetch(`/api/rooms/${roomId}?playerId=${playerId}`);
-        const contentType = res.headers.get('content-type') || '';
-        if (!res.ok || !contentType.includes('application/json')) return;
-        const data = await res.json();
-        if (isSubscribed && data.success && data.room) {
-          const room: GameRoom = data.room;
+        const room: GameRoom = {
+          id: data.id,
+          isPrivate: data.isPrivate ?? false,
+          createdAt: data.createdAt ?? Date.now(),
+          lastActive: data.lastActive ?? Date.now(),
+          status: data.status ?? 'waiting',
+          playerBlack: data.playerBlack ?? null,
+          playerWhite: data.playerWhite ?? null,
+          spectators: Array.isArray(data.spectators) ? data.spectators : [],
+          board: parsedBoard,
+          currentTurn: data.currentTurn ?? 'B',
+          isGameOver: data.isGameOver ?? false,
+          winner: data.winner ?? null,
+          winReason: data.winReason,
+          blackCount: data.blackCount ?? 2,
+          whiteCount: data.whiteCount ?? 2,
+          moveHistory: Array.isArray(data.moveHistory) ? data.moveHistory : [],
+          lastMove: data.lastMove ?? null,
+          lastFlipped: Array.isArray(data.lastFlipped) ? data.lastFlipped : [],
+          chatMessages: Array.isArray(data.chatMessages) ? data.chatMessages : [],
+          turnStartTime: data.turnStartTime ?? Date.now(),
+          turnDurationSeconds: data.turnDurationSeconds ?? 45,
+        };
 
-          // Sound triggers on new opponent move from server
-          const moveLen = room.moveHistory.length;
-          if (moveLen > prevMoveRef.current) {
-            const lastM = room.moveHistory[moveLen - 1];
-            if (lastM && lastM.player !== myOnlineRole) {
-              sounds.playStoneClack();
-              if (lastM.flippedCount > 0) {
-                sounds.playFlipStone(lastM.flippedCount);
-              }
-              if (room.currentTurn === myOnlineRole && !room.isGameOver) {
-                sounds.playTurnAlert();
-              }
+        // Sound triggers on new opponent move
+        const moveLen = room.moveHistory.length;
+        if (moveLen > prevMoveRef.current) {
+          const lastM = room.moveHistory[moveLen - 1];
+          if (lastM && lastM.player !== myOnlineRole) {
+            sounds.playStoneClack();
+            if (lastM.flippedCount > 0) {
+              sounds.playFlipStone(lastM.flippedCount);
             }
-            prevMoveRef.current = moveLen;
+            if (room.currentTurn === myOnlineRole && !room.isGameOver) {
+              sounds.playTurnAlert();
+            }
           }
+          prevMoveRef.current = moveLen;
+        }
 
-          if (room.isGameOver && !isOnlineGameOver) {
-            sounds.playVictory();
-          }
+        if (room.isGameOver && !isOnlineGameOver) {
+          sounds.playVictory();
+        }
 
-          // Calculate time left (45s max per turn)
-          const elapsed = (Date.now() - room.turnStartTime) / 1000;
-          const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
-          setTurnTimeLeft(remaining);
+        // Calculate time left (45s max per turn)
+        const elapsed = (Date.now() - room.turnStartTime) / 1000;
+        const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
+        setTurnTimeLeft(remaining);
 
-          // Auto-close matchmaking/waiting and show "BẮT ĐẦU" notification
-          if (room.status === 'playing' && !hasAnnouncedStartRef.current) {
+        // When guest enters room and status becomes 'playing':
+        // IMMEDIATELY CLOSE THE "MỜI BẠN CÙNG CHƠI" POPUP
+        if (room.status === 'playing') {
+          setShowShareModal(false);
+          setIsMatchmaking(false);
+          if (!hasAnnouncedStartRef.current) {
             hasAnnouncedStartRef.current = true;
             triggerGameStartAnnouncement();
           }
-
-          if (room.status === 'playing') {
-            setShowShareModal(false);
-            setIsMatchmaking(false);
-          }
-
-          setOnlineRoom(room);
         }
-      } catch (err) {
-        console.error('Polling room error:', err);
-      }
 
-      if (isSubscribed) {
-        // Fast 350ms polling when waiting for opponent move
-        // 750ms when waiting for user to move or game is ended
-        const isWaitingForOpponent =
-          roomStatus === 'playing' && currentRoomTurn !== myOnlineRole && !isOnlineGameOver;
-        const intervalMs = isWaitingForOpponent ? 350 : 750;
-        pollTimer = setTimeout(fetchRoomState, intervalMs);
-      }
-    };
+        // Auto-sync player's assigned role if missing or changed
+        if (room.playerBlack?.id === playerId && myOnlineRole !== 'B') {
+          setMyOnlineRole('B');
+        } else if (room.playerWhite?.id === playerId && myOnlineRole !== 'W') {
+          setMyOnlineRole('W');
+        }
 
-    fetchRoomState();
+        setOnlineRoom(room);
+      },
+      (err) => {
+        console.warn('Firestore room snapshot error:', err);
+      }
+    );
+
+    // Keep heartbeat fresh on server/Firestore
+    const heartbeatTimer = setInterval(() => {
+      if (isSubscribed && roomId && playerId) {
+        fetch(`/api/rooms/${roomId}?playerId=${playerId}`).catch(() => {});
+      }
+    }, 5000);
 
     return () => {
       isSubscribed = false;
-      clearTimeout(pollTimer);
+      unsubscribe();
+      clearInterval(heartbeatTimer);
     };
   }, [
     mode,
@@ -610,8 +651,6 @@ function GameApp() {
     playerId,
     myOnlineRole,
     isOnlineGameOver,
-    currentRoomTurn,
-    roomStatus,
     triggerGameStartAnnouncement,
   ]);
 
@@ -635,14 +674,24 @@ function GameApp() {
   // ----------------- ONLINE MOVE ACTIONS (OPTIMISTIC 0MS RESPONSE) -----------------
 
   const handleOnlineMove = async (r: number, c: number) => {
-    if (!onlineRoom || onlineRoom.status !== 'playing' || onlineRoom.isGameOver) return;
-    if (onlineRoom.currentTurn !== myOnlineRole) return;
-    if (onlineRoom.board[r][c] !== null) return;
+    const myRole = effectiveMyRole;
+    if (!myRole || myRole === 'spectator') return;
+    if (!onlineRoom || onlineRoom.status !== 'playing' || onlineRoom.isGameOver) {
+      sounds.playInvalid();
+      return;
+    }
+    if (onlineRoom.currentTurn !== myRole) {
+      sounds.playInvalid();
+      return;
+    }
+    if (onlineRoom.board[r][c] !== null) {
+      sounds.playInvalid();
+      return;
+    }
 
     // 1. Instant sound feedback on tap
     sounds.playStoneClack();
 
-    const myRole = myOnlineRole;
     const opponentRole: StoneColor = myRole === 'B' ? 'W' : 'B';
     const flipped = getFlippedStones(onlineRoom.board, r, c, myRole);
     if (flipped.length > 0) {
@@ -705,6 +754,7 @@ function GameApp() {
         body: JSON.stringify({
           action: 'move',
           playerId,
+          playerColor: myRole,
           r,
           c,
         }),
@@ -1025,9 +1075,19 @@ function GameApp() {
   const activeTurn = mode === 'online_room' ? onlineRoom?.currentTurn ?? 'B' : currentTurn;
   const activeCounts = countStones(activeBoard);
 
+  // Determine real role in current online room (self-healing against desync)
+  const effectiveMyRole: StoneColor | 'spectator' | null =
+    mode === 'online_room' && onlineRoom
+      ? onlineRoom.playerBlack?.id === playerId
+        ? 'B'
+        : onlineRoom.playerWhite?.id === playerId
+        ? 'W'
+        : myOnlineRole
+      : myOnlineRole;
+
   const myColor =
     mode === 'online_room'
-      ? myOnlineRole
+      ? effectiveMyRole
       : mode === 'ai'
       ? 'B'
       : null;
@@ -1036,7 +1096,7 @@ function GameApp() {
     mode === 'online_room'
       ? onlineRoom?.status === 'playing' &&
         !onlineRoom?.isGameOver &&
-        onlineRoom?.currentTurn === myOnlineRole
+        onlineRoom?.currentTurn === effectiveMyRole
       : mode === 'ai'
       ? currentTurn === 'B' && !isAiThinking && !isGameOver
       : !isGameOver;
@@ -1376,21 +1436,25 @@ function GameApp() {
           )}
 
           {/* Status Bar */}
-          <div className="h-6 w-full flex items-center justify-center mb-1 text-xs">
+          <div className="h-7 w-full flex items-center justify-center mb-1 text-xs">
             {mode === 'ai' && isAiThinking ? (
               <div className="text-[#24201D] flex items-center gap-1.5 font-bold">
                 <Bot className="w-3.5 h-3.5" />
                 <span>AI đang tính toán nước đi...</span>
               </div>
+            ) : mode === 'online_room' && onlineRoom?.status === 'waiting' ? (
+              <div className="text-[#A83226] font-bold flex items-center gap-1.5 animate-pulse">
+                <span>Đang đợi đối thủ vào phòng...</span>
+              </div>
             ) : (
               <div className="text-[#5C544B]">
                 {isMyTurn ? (
-                  <span className="text-[#24201D] font-bold">
-                    Lượt của bạn ({activeTurn === 'B' ? 'Quân Đen' : 'Quân Trắng'})
+                  <span className="text-[#2E6B34] font-black text-sm bg-[#EBF3EC] px-3 py-1 rounded-full border border-[#C5DEC8] shadow-xs">
+                    ▶ Lượt của bạn ({activeTurn === 'B' ? 'Quân Đen' : 'Quân Trắng'})
                   </span>
                 ) : (
-                  <span>
-                    Chờ đối thủ ({activeTurn === 'B' ? 'Quân Đen' : 'Quân Trắng'}) đi...
+                  <span className="text-[#6B635A] font-semibold">
+                    Đang chờ đối thủ ({activeTurn === 'B' ? 'Quân Đen' : 'Quân Trắng'}) đi...
                   </span>
                 )}
               </div>
@@ -1528,6 +1592,16 @@ function GameApp() {
           </div>
         </div>
       )}
+
+      {/* 7. Footer displaying game version */}
+      <footer className="w-full max-w-4xl mt-auto pt-6 pb-4 text-center text-xs text-[#8A8275] flex flex-col sm:flex-row items-center justify-center gap-2 select-none">
+        <span>© 2026 Flank Go • Cờ Vây Kẹp Online</span>
+        <span className="hidden sm:inline">•</span>
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-[#EAE2D2] text-[#4A4237] rounded-full font-mono text-[11px] font-bold border border-[#D5CCBC] shadow-2xs">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse" />
+          Phiên bản v2.5.0
+        </span>
+      </footer>
     </main>
   );
 }

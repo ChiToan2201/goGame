@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'create') {
-      const room = multiplayerStore.createRoom(
+      const room = await multiplayerStore.createRoomAsync(
         {
           id: player.id,
           name: player.name || 'Chủ phòng',
@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
       if (!roomId) {
         return NextResponse.json({ error: 'Mã phòng không được để trống' }, { status: 400 });
       }
-      const result = multiplayerStore.joinRoom(roomId, player);
+      const result = await multiplayerStore.joinRoomAsync(roomId, player);
       if ('error' in result) {
         return NextResponse.json({ error: result.error }, { status: 404 });
       }
