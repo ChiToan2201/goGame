@@ -28,10 +28,10 @@ import {
   AIDifficulty,
   sounds,
 } from '@/lib/game-engine';
-import { GameRoom } from '@/lib/multiplayer-store';
+import { GameRoom, toFirestoreData, fromFirestoreData } from '@/lib/multiplayer-store';
 import { P2PGameSync } from '@/lib/p2p-sync';
 import { db } from '@/lib/firebase';
-import { doc, onSnapshot } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
 import { GobanBoard } from '@/components/GobanBoard';
 import { GameHeader } from '@/components/GameHeader';
 import { MatchmakingModal } from '@/components/MatchmakingModal';
@@ -97,9 +97,20 @@ export default function GamePage() {
   return <GameApp />;
 }
 
+function getSessionPlayerId(): string {
+  if (typeof window === 'undefined') return '';
+  let pid = sessionStorage.getItem('flank_player_session_id');
+  if (!pid || pid === 'user_init') {
+    pid = 'user_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 9);
+    sessionStorage.setItem('flank_player_session_id', pid);
+  }
+  return pid;
+}
+
 function GameApp() {
   // User Profile
   const [playerName, setPlayerName] = useState(() => {
+    if (typeof window === 'undefined') return 'Kỳ Thủ Flank';
     const saved = localStorage.getItem('flank_player_name');
     if (saved) return saved;
     const initial = getRandomProfile();
@@ -108,18 +119,15 @@ function GameApp() {
   });
 
   const [avatar, setAvatar] = useState(() => {
+    if (typeof window === 'undefined') return '🥋';
     return localStorage.getItem('flank_player_avatar') || '🥋';
   });
 
-  const [playerId] = useState(() => {
-    if (typeof window === 'undefined') return 'user_init';
-    let pid = sessionStorage.getItem('flank_player_session_id');
-    if (!pid) {
-      pid = 'user_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
-      sessionStorage.setItem('flank_player_session_id', pid);
-    }
-    return pid;
-  });
+  const playerId = useSyncExternalStore(
+    emptySubscribe,
+    getSessionPlayerId,
+    () => ''
+  );
 
   // App State
   const [mode, setMode] = useState<GameMode>('lobby');
@@ -546,99 +554,85 @@ function GameApp() {
 
     let isSubscribed = true;
 
-    // Real-time Firestore snapshot listener: sub-50ms sync across devices & Vercel
+    // Helper to process and update room state from either Firestore snapshot or polling
+    const processRoomUpdate = (room: GameRoom) => {
+      if (!isSubscribed) return;
+
+      // Sound triggers on new opponent move
+      const moveLen = room.moveHistory.length;
+      if (moveLen > prevMoveRef.current) {
+        const lastM = room.moveHistory[moveLen - 1];
+        if (lastM && lastM.player !== myOnlineRole) {
+          sounds.playStoneClack();
+          if (lastM.flippedCount > 0) {
+            sounds.playFlipStone(lastM.flippedCount);
+          }
+          if (room.currentTurn === myOnlineRole && !room.isGameOver) {
+            sounds.playTurnAlert();
+          }
+        }
+        prevMoveRef.current = moveLen;
+      }
+
+      if (room.isGameOver && !isOnlineGameOver) {
+        sounds.playVictory();
+      }
+
+      // Calculate time left (45s max per turn)
+      const elapsed = (Date.now() - room.turnStartTime) / 1000;
+      const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
+      setTurnTimeLeft(remaining);
+
+      // When guest enters room and status becomes 'playing':
+      // IMMEDIATELY CLOSE THE "MỜI BẠN CÙNG CHƠI" POPUP
+      const isNowPlaying = room.status === 'playing' || (!!room.playerBlack && !!room.playerWhite && !room.isGameOver);
+      if (isNowPlaying) {
+        setShowShareModal(false);
+        setIsMatchmaking(false);
+        if (!hasAnnouncedStartRef.current) {
+          hasAnnouncedStartRef.current = true;
+          triggerGameStartAnnouncement();
+        }
+      }
+
+      // Auto-sync player's assigned role if missing or changed
+      if (room.playerBlack?.id === playerId && myOnlineRole !== 'B') {
+        setMyOnlineRole('B');
+      } else if (room.playerWhite?.id === playerId && myOnlineRole !== 'W') {
+        setMyOnlineRole('W');
+      }
+
+      setOnlineRoom(room);
+    };
+
+    // 1. Real-time Firestore snapshot listener: sub-50ms sync across devices
     const unsubscribe = onSnapshot(
       doc(db, 'rooms', roomId),
       (snap) => {
         if (!isSubscribed || !snap.exists()) return;
-        const data = snap.data();
-        let parsedBoard: BoardState;
-        try {
-          parsedBoard = data.boardStr ? JSON.parse(data.boardStr) : (data.board || createInitialBoard(8));
-        } catch {
-          parsedBoard = createInitialBoard(8);
-        }
-
-        const room: GameRoom = {
-          id: data.id,
-          isPrivate: data.isPrivate ?? false,
-          createdAt: data.createdAt ?? Date.now(),
-          lastActive: data.lastActive ?? Date.now(),
-          status: data.status ?? 'waiting',
-          playerBlack: data.playerBlack ?? null,
-          playerWhite: data.playerWhite ?? null,
-          spectators: Array.isArray(data.spectators) ? data.spectators : [],
-          board: parsedBoard,
-          currentTurn: data.currentTurn ?? 'B',
-          isGameOver: data.isGameOver ?? false,
-          winner: data.winner ?? null,
-          winReason: data.winReason,
-          blackCount: data.blackCount ?? 2,
-          whiteCount: data.whiteCount ?? 2,
-          moveHistory: Array.isArray(data.moveHistory) ? data.moveHistory : [],
-          lastMove: data.lastMove ?? null,
-          lastFlipped: Array.isArray(data.lastFlipped) ? data.lastFlipped : [],
-          chatMessages: Array.isArray(data.chatMessages) ? data.chatMessages : [],
-          turnStartTime: data.turnStartTime ?? Date.now(),
-          turnDurationSeconds: data.turnDurationSeconds ?? 45,
-        };
-
-        // Sound triggers on new opponent move
-        const moveLen = room.moveHistory.length;
-        if (moveLen > prevMoveRef.current) {
-          const lastM = room.moveHistory[moveLen - 1];
-          if (lastM && lastM.player !== myOnlineRole) {
-            sounds.playStoneClack();
-            if (lastM.flippedCount > 0) {
-              sounds.playFlipStone(lastM.flippedCount);
-            }
-            if (room.currentTurn === myOnlineRole && !room.isGameOver) {
-              sounds.playTurnAlert();
-            }
-          }
-          prevMoveRef.current = moveLen;
-        }
-
-        if (room.isGameOver && !isOnlineGameOver) {
-          sounds.playVictory();
-        }
-
-        // Calculate time left (45s max per turn)
-        const elapsed = (Date.now() - room.turnStartTime) / 1000;
-        const remaining = Math.max(0, Math.floor(room.turnDurationSeconds - elapsed));
-        setTurnTimeLeft(remaining);
-
-        // When guest enters room and status becomes 'playing':
-        // IMMEDIATELY CLOSE THE "MỜI BẠN CÙNG CHƠI" POPUP
-        if (room.status === 'playing') {
-          setShowShareModal(false);
-          setIsMatchmaking(false);
-          if (!hasAnnouncedStartRef.current) {
-            hasAnnouncedStartRef.current = true;
-            triggerGameStartAnnouncement();
-          }
-        }
-
-        // Auto-sync player's assigned role if missing or changed
-        if (room.playerBlack?.id === playerId && myOnlineRole !== 'B') {
-          setMyOnlineRole('B');
-        } else if (room.playerWhite?.id === playerId && myOnlineRole !== 'W') {
-          setMyOnlineRole('W');
-        }
-
-        setOnlineRoom(room);
+        const room = fromFirestoreData(snap.data());
+        processRoomUpdate(room);
       },
       (err) => {
         console.warn('Firestore room snapshot error:', err);
       }
     );
 
-    // Keep heartbeat fresh on server/Firestore
-    const heartbeatTimer = setInterval(() => {
-      if (isSubscribed && roomId && playerId) {
-        fetch(`/api/rooms/${roomId}?playerId=${playerId}`).catch(() => {});
+    // 2. Active sync & heartbeat polling fallback every 1000ms
+    // Guarantees room state updates even if WebSocket has jitter or reconnects
+    const heartbeatTimer = setInterval(async () => {
+      if (!isSubscribed || !roomId || !playerId) return;
+      try {
+        const res = await fetch(`/api/rooms/${roomId}?playerId=${playerId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.success && data.room) {
+          processRoomUpdate(data.room);
+        }
+      } catch {
+        // Safe catch
       }
-    }, 5000);
+    }, 1000);
 
     return () => {
       isSubscribed = false;
@@ -671,44 +665,82 @@ function GameApp() {
     };
   }, [mode, onlineRoom, playerId]);
 
+  // Compute counts & valid moves based on active mode
+  const activeBoard = mode === 'online_room' ? onlineRoom?.board ?? board : board;
+  const activeTurn = mode === 'online_room' ? onlineRoom?.currentTurn ?? 'B' : currentTurn;
+  const activeCounts = countStones(activeBoard);
+
+  // Determine real role in current online room (self-healing against desync)
+  const effectiveMyRole: StoneColor | 'spectator' | null =
+    mode === 'online_room' && onlineRoom
+      ? onlineRoom.playerBlack?.id === playerId
+        ? 'B'
+        : onlineRoom.playerWhite?.id === playerId
+        ? 'W'
+        : myOnlineRole
+      : myOnlineRole;
+
+  const isOnlinePlaying =
+    mode === 'online_room' &&
+    !!onlineRoom &&
+    (onlineRoom.status === 'playing' || (!!onlineRoom.playerBlack && !!onlineRoom.playerWhite && !onlineRoom.isGameOver));
+
+  const myColor =
+    mode === 'online_room'
+      ? effectiveMyRole
+      : mode === 'ai'
+      ? 'B'
+      : null;
+
+  const isMyTurn =
+    mode === 'online_room'
+      ? isOnlinePlaying &&
+        !onlineRoom?.isGameOver &&
+        onlineRoom?.currentTurn === effectiveMyRole
+      : mode === 'ai'
+      ? currentTurn === 'B' && !isAiThinking && !isGameOver
+      : !isGameOver;
+
+  const validMoves = isMyTurn ? getValidMoves(activeBoard, activeTurn) : [];
+
   // ----------------- ONLINE MOVE ACTIONS (OPTIMISTIC 0MS RESPONSE) -----------------
 
-  const handleOnlineMove = async (r: number, c: number) => {
-    const myRole = effectiveMyRole;
-    if (!myRole || myRole === 'spectator') return;
-    if (!onlineRoom || onlineRoom.status !== 'playing' || onlineRoom.isGameOver) {
-      sounds.playInvalid();
-      return;
-    }
-    if (onlineRoom.currentTurn !== myRole) {
-      sounds.playInvalid();
-      return;
-    }
-    if (onlineRoom.board[r][c] !== null) {
-      sounds.playInvalid();
-      return;
-    }
+  const handleOnlineMove = useCallback(
+    async (r: number, c: number) => {
+      const myRole = effectiveMyRole;
+      if (!myRole || myRole === 'spectator') return;
+      if (!onlineRoom || !isOnlinePlaying || onlineRoom.isGameOver) {
+        sounds.playInvalid();
+        return;
+      }
+      if (onlineRoom.currentTurn !== myRole) {
+        sounds.playInvalid();
+        return;
+      }
+      if (onlineRoom.board[r][c] !== null) {
+        sounds.playInvalid();
+        return;
+      }
 
-    // 1. Instant sound feedback on tap
-    sounds.playStoneClack();
+      // 1. Instant sound feedback on tap
+      sounds.playStoneClack();
 
-    const opponentRole: StoneColor = myRole === 'B' ? 'W' : 'B';
-    const flipped = getFlippedStones(onlineRoom.board, r, c, myRole);
-    if (flipped.length > 0) {
-      sounds.playFlipStone(flipped.length);
-    }
+      const opponentRole: StoneColor = myRole === 'B' ? 'W' : 'B';
+      const flipped = getFlippedStones(onlineRoom.board, r, c, myRole);
+      if (flipped.length > 0) {
+        sounds.playFlipStone(flipped.length);
+      }
 
-    // 2. Instant Optimistic Board Update (0ms delay on player's screen!)
-    const moveResult = applyMove(onlineRoom.board, r, c, myRole);
-    if (!moveResult) return;
-    const optimisticBoard = moveResult.newBoard;
-    const counts = countStones(optimisticBoard);
-    const prevRoomSnapshot = onlineRoom;
+      // 2. Instant Optimistic Board Update (0ms delay on player's screen!)
+      const moveResult = applyMove(onlineRoom.board, r, c, myRole);
+      if (!moveResult) return;
+      const optimisticBoard = moveResult.newBoard;
+      const counts = countStones(optimisticBoard);
+      const moveNow = Date.now();
 
-    setOnlineRoom((prev) => {
-      if (!prev) return null;
-      return {
-        ...prev,
+      const optimisticRoom: GameRoom = {
+        ...onlineRoom,
+        status: moveResult.isGameOver ? 'ended' : 'playing',
         board: optimisticBoard,
         currentTurn: opponentRole,
         blackCount: counts.black,
@@ -717,62 +749,84 @@ function GameApp() {
         winner: moveResult.winner,
         lastMove: { r, c, player: myRole },
         lastFlipped: flipped,
-        turnStartTime: Date.now(),
+        turnStartTime: moveNow,
+        lastActive: moveNow,
         moveHistory: [
-          ...prev.moveHistory,
+          ...onlineRoom.moveHistory,
           {
             player: myRole,
             r,
             c,
             flippedCount: flipped.length,
-            timestamp: Date.now(),
+            timestamp: moveNow,
           },
         ],
       };
-    });
-    setTurnTimeLeft(45);
-    prevMoveRef.current = onlineRoom.moveHistory.length + 1;
 
-    if (moveResult.isGameOver) {
-      sounds.playVictory();
-    }
-
-    // 3. Fast P2P delivery to opponent
-    p2pRef.current?.send({
-      type: 'MOVE',
-      r,
-      c,
-      playerId,
-      playerColor: myRole,
-    });
-
-    // 4. Server API synchronization
-    try {
-      const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'move',
-          playerId,
-          playerColor: myRole,
-          r,
-          c,
-        }),
-      });
-      const contentType = res.headers.get('content-type') || '';
-      if (!res.ok || !contentType.includes('application/json')) return;
-      const data = await res.json();
-      if (data.success && data.room) {
-        setOnlineRoom(data.room);
-      } else if (!p2pRef.current) {
-        // Rollback only if pure server mode and server explicitly rejected
-        setOnlineRoom(prevRoomSnapshot);
-        sounds.playInvalid();
+      if (moveResult.isGameOver) {
+        if (moveResult.winner === 'DRAW') {
+          optimisticRoom.winReason = 'Hai bên bằng điểm nhau! Kết quả hòa cờ!';
+        } else {
+          const winnerName =
+            moveResult.winner === 'B'
+              ? onlineRoom.playerBlack?.name || 'Quân Đen'
+              : onlineRoom.playerWhite?.name || 'Quân Trắng';
+          optimisticRoom.winReason = `${winnerName} (${moveResult.winner === 'B' ? 'Đen' : 'Trắng'}) giành chiến thắng!`;
+        }
       }
-    } catch (err) {
-      console.error('Online move error:', err);
-    }
-  };
+
+      setOnlineRoom(optimisticRoom);
+      setTurnTimeLeft(45);
+      prevMoveRef.current = optimisticRoom.moveHistory.length;
+
+      if (moveResult.isGameOver) {
+        sounds.playVictory();
+      }
+
+      // 3. Fast P2P delivery to opponent
+      p2pRef.current?.send({
+        type: 'MOVE',
+        r,
+        c,
+        playerId,
+        playerColor: myRole,
+      });
+
+      // 4. Instant direct Firestore write (Sub-50ms sync to opponent)
+      try {
+        const cleanData = toFirestoreData(optimisticRoom);
+        setDoc(doc(db, 'rooms', onlineRoom.id), cleanData).catch((e) => {
+          console.warn('Firestore setDoc move error:', e);
+        });
+      } catch (e) {
+        console.warn('Firestore direct write move error:', e);
+      }
+
+      // 5. Server API synchronization
+      try {
+        const res = await fetch(`/api/rooms/${onlineRoom.id}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'move',
+            playerId,
+            playerColor: myRole,
+            r,
+            c,
+          }),
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (!res.ok || !contentType.includes('application/json')) return;
+        const data = await res.json();
+        if (data.success && data.room) {
+          setOnlineRoom(data.room);
+        }
+      } catch (err) {
+        console.error('Online move error:', err);
+      }
+    },
+    [effectiveMyRole, isOnlinePlaying, onlineRoom, playerId]
+  );
 
   const handleOnlineSurrender = async () => {
     if (!onlineRoom || onlineRoom.isGameOver) return;
@@ -1069,39 +1123,6 @@ function GameApp() {
     setIsMatchmaking(false);
     hasAnnouncedStartRef.current = false;
   };
-
-  // Compute counts & valid moves based on active mode
-  const activeBoard = mode === 'online_room' ? onlineRoom?.board ?? board : board;
-  const activeTurn = mode === 'online_room' ? onlineRoom?.currentTurn ?? 'B' : currentTurn;
-  const activeCounts = countStones(activeBoard);
-
-  // Determine real role in current online room (self-healing against desync)
-  const effectiveMyRole: StoneColor | 'spectator' | null =
-    mode === 'online_room' && onlineRoom
-      ? onlineRoom.playerBlack?.id === playerId
-        ? 'B'
-        : onlineRoom.playerWhite?.id === playerId
-        ? 'W'
-        : myOnlineRole
-      : myOnlineRole;
-
-  const myColor =
-    mode === 'online_room'
-      ? effectiveMyRole
-      : mode === 'ai'
-      ? 'B'
-      : null;
-
-  const isMyTurn =
-    mode === 'online_room'
-      ? onlineRoom?.status === 'playing' &&
-        !onlineRoom?.isGameOver &&
-        onlineRoom?.currentTurn === effectiveMyRole
-      : mode === 'ai'
-      ? currentTurn === 'B' && !isAiThinking && !isGameOver
-      : !isGameOver;
-
-  const validMoves = isMyTurn ? getValidMoves(activeBoard, activeTurn) : [];
 
   return (
     <main className="min-h-screen bg-[#F5F1E8] text-[#1F1C19] flex flex-col items-center justify-between p-3 sm:p-6 selection:bg-[#A83226] selection:text-white">
@@ -1417,14 +1438,14 @@ function GameApp() {
           />
 
           {/* Waiting For Opponent Banner */}
-          {mode === 'online_room' && onlineRoom?.status === 'waiting' && (
+          {mode === 'online_room' && !isOnlinePlaying && !onlineRoom?.isGameOver && (
             <div className="w-full bg-[#FAF6EF] border border-[#DDD3C2] rounded-xl p-3.5 mb-2 text-center shadow-xs">
               <div className="flex items-center justify-center gap-2 text-[#1F1C19] font-bold text-xs mb-1">
                 <span className="w-2 h-2 rounded-full bg-[#24201D] animate-ping" />
-                <span>Đang chờ đối thủ vào phòng {onlineRoom.id}...</span>
+                <span>Đang chờ đối thủ vào phòng {onlineRoom?.id}...</span>
               </div>
               <p className="text-[11px] text-[#6B635A] mb-2.5">
-                Gửi mã phòng <strong>{onlineRoom.id}</strong> cho bạn bè để bắt đầu ván cờ.
+                Gửi mã phòng <strong>{onlineRoom?.id}</strong> cho bạn bè để bắt đầu ván cờ.
               </p>
               <button
                 onClick={() => setShowShareModal(true)}
@@ -1442,7 +1463,7 @@ function GameApp() {
                 <Bot className="w-3.5 h-3.5" />
                 <span>AI đang tính toán nước đi...</span>
               </div>
-            ) : mode === 'online_room' && onlineRoom?.status === 'waiting' ? (
+            ) : mode === 'online_room' && !isOnlinePlaying && !onlineRoom?.isGameOver ? (
               <div className="text-[#A83226] font-bold flex items-center gap-1.5 animate-pulse">
                 <span>Đang đợi đối thủ vào phòng...</span>
               </div>
@@ -1471,7 +1492,7 @@ function GameApp() {
             lastFlipped={mode === 'online_room' ? onlineRoom?.lastFlipped ?? [] : lastFlipped}
             isMyTurn={isMyTurn}
             disabled={
-              (mode === 'online_room' && onlineRoom?.status !== 'playing') ||
+              (mode === 'online_room' && !isOnlinePlaying) ||
               isAiThinking ||
               (mode === 'online_room' ? onlineRoom?.isGameOver : isGameOver)
             }
@@ -1599,7 +1620,7 @@ function GameApp() {
         <span className="hidden sm:inline">•</span>
         <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-[#EAE2D2] text-[#4A4237] rounded-full font-mono text-[11px] font-bold border border-[#D5CCBC] shadow-2xs">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse" />
-          Phiên bản v1.1
+          Phiên bản v1.2
         </span>
       </footer>
     </main>

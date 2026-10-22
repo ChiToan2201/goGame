@@ -94,17 +94,19 @@ if (!globalThis.__FLANK_MATCH_QUEUE) {
 const localRooms = globalThis.__FLANK_GAME_ROOMS;
 
 // Helper: Convert GameRoom to Firestore document representation
-// (Firestore forbids nested arrays like BoardState `(StoneColor | null)[][]`)
-function toFirestoreData(room: GameRoom): Record<string, any> {
+// (Firestore forbids nested arrays like BoardState `(StoneColor | null)[][]` and throws on `undefined` fields)
+export function toFirestoreData(room: GameRoom): Record<string, any> {
   const { board, ...rest } = room;
-  return {
+  const raw = {
     ...rest,
     boardStr: JSON.stringify(board),
   };
+  // Recursively strips any `undefined` values so Firestore setDoc never rejects with Unsupported field value: undefined
+  return JSON.parse(JSON.stringify(raw));
 }
 
 // Helper: Convert Firestore doc back to GameRoom
-function fromFirestoreData(data: any): GameRoom {
+export function fromFirestoreData(data: any): GameRoom {
   let parsedBoard: BoardState;
   try {
     parsedBoard = data.boardStr ? JSON.parse(data.boardStr) : (data.board || createInitialBoard(8));
@@ -112,20 +114,29 @@ function fromFirestoreData(data: any): GameRoom {
     parsedBoard = createInitialBoard(8);
   }
 
+  const isGameOver = data.isGameOver ?? false;
+  const hasBothPlayers = !!data.playerBlack && !!data.playerWhite;
+  // Automatically self-heal room status: if both players are in room and game is not finished, status MUST be playing!
+  const status: 'waiting' | 'playing' | 'ended' = isGameOver
+    ? 'ended'
+    : hasBothPlayers || data.status === 'playing'
+    ? 'playing'
+    : (data.status ?? 'waiting');
+
   return {
     id: data.id,
     isPrivate: data.isPrivate ?? false,
     createdAt: data.createdAt ?? Date.now(),
     lastActive: data.lastActive ?? Date.now(),
-    status: data.status ?? 'waiting',
+    status,
     playerBlack: data.playerBlack ?? null,
     playerWhite: data.playerWhite ?? null,
-    spectators: data.spectators ?? [],
+    spectators: Array.isArray(data.spectators) ? data.spectators : [],
     board: parsedBoard,
     currentTurn: data.currentTurn ?? 'B',
-    isGameOver: data.isGameOver ?? false,
+    isGameOver,
     winner: data.winner ?? null,
-    winReason: data.winReason,
+    winReason: data.winReason || undefined,
     blackCount: data.blackCount ?? 2,
     whiteCount: data.whiteCount ?? 2,
     moveHistory: Array.isArray(data.moveHistory) ? data.moveHistory : [],
@@ -137,11 +148,12 @@ function fromFirestoreData(data: any): GameRoom {
   };
 }
 
-// Persist room to Firestore
+// Persist room to Firestore with sanitized payload
 async function persistRoom(room: GameRoom): Promise<void> {
   try {
     localRooms.set(room.id, room);
-    await setDoc(doc(db, 'rooms', room.id), toFirestoreData(room));
+    const cleanData = toFirestoreData(room);
+    await setDoc(doc(db, 'rooms', room.id), cleanData);
   } catch (err) {
     console.error('Firestore persistRoom error:', err);
   }
